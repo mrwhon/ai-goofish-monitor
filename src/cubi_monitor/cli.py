@@ -1,193 +1,229 @@
+"""Generic monitor CLI. One database lock owns all persistence/browser/send effects."""
 import argparse
 import asyncio
 import fcntl
-import html
 import json
 import os
 from pathlib import Path
-import subprocess
+import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from .browser import Browser
-from .ledger import Ledger, material_digest
-from .policy import criteria_id, judge
-
-
-def load_profile(path):
-    profile = json.loads(Path(path).read_text())
-    if profile.get("schema") != 1:
-        raise ValueError("unsupported_profile")
-    if not 1 <= len(profile["queries"]) <= 8:
-        raise ValueError("query_count_out_of_bounds")
-    for query in profile["queries"]:
-        if not isinstance(query["keyword"], str) or len(query["keyword"]) > 80:
-            raise ValueError("invalid_keyword")
-    if not 1 <= profile.get("pages", 2) <= 2 or not 1 <= profile.get("detail_limit", 3) <= 3:
-        raise ValueError("capture_limit_out_of_bounds")
-    if not 30 <= profile.get("timeout", 600) <= 900:
-        raise ValueError("timeout_out_of_bounds")
-    return profile
+from .analysis import Analyzer
+from .browser import Browser, CaptureError
+from .config import load_config
+from .contracts import AnalysisError, AnalysisInput, AnalysisResult
+from .ledger import Ledger, digest
+from .notifications import flush, message
+from .policy import criteria_id, triage
+from .transport import ChatTransport
 
 
-def message(body):
-    body = json.loads(body)
-    esc = lambda s: html.escape(str(s))
-    quote = f"；已知议价 {esc(body['quote'])} 元（未重新确认）" if body.get("quote") is not None else ""
-    return f"闲鱼待核实候选\n{esc(body['title'][:300])}\n标价 {esc(body['price'])} 元{quote}\n{esc(body['reason'][:700])}\n{esc(body['url'])}"
+def prioritize(item, monitor):
+    text = item.get("title", "")+" "+item.get("description", "")
+    for rule in monitor["criteria"].get("rules", []):
+        if re.search(rule["pattern"], text, re.I):
+            price, ceiling = item.get("price"), rule.get("ceiling")
+            return max(.1, 2-price/ceiling) if price is not None and ceiling else 1
+    return 0
 
 
-def flush(ledger, sender, now=None):
-    if not ledger.active(now):
-        raise ValueError("trial_inactive_or_expired")
-    count = 0
-    for event in ledger.outbox():
-        body = json.loads(event["body"])
-        current = ledger.db.execute("SELECT * FROM items WHERE id=?", (event["item_id"],)).fetchone()
-        if current["pending"] or body.get("criteria") != current["criteria"] or body.get("fingerprint") != material_digest(json.loads(current["snapshot"])):
-            ledger.finish_send(event["event"], False)
-            continue  # Keep stale/ambiguous events for explicit reconciliation, never recommend stale facts.
-        ledger.claim_send(event["event"])
-        try:
-            result = subprocess.run([sender, "xianyu-monitor", message(event["body"])], stdin=subprocess.DEVNULL, capture_output=True, timeout=45, check=False)
-            ledger.finish_send(event["event"], result.returncode == 0)
-            if result.returncode:
-                break  # The sender's nonzero response cannot rule out network ambiguity.
-            count += 1
-        except (OSError, subprocess.TimeoutExpired):
-            ledger.finish_send(event["event"], False)
-            break
-    return count
+def input_for(ledger, monitor, item_id):
+    row = ledger.item(monitor["monitor_id"], item_id)
+    item = json.loads(row["snapshot"])
+    gaps = [name+" 未提供" for name in ("price","description","seller_id","availability") if not item.get(name)]
+    item["image_count"] = len(item.pop("images",[]))
+    item.pop("thumbnail",None)  # Text transport does not read pixels/URLs.
+    if len(item.get("description", "")) > 8000:
+        item["description"] = item["description"][:8000]
+        gaps.append("描述超过8000字，本次只读取前段，完整文字仍留在账本")
+    if len(item.get("title", "")) > 500:
+        item["title"] = item["title"][:500]
+        gaps.append("标题过长，已限量")
+    return AnalysisInput(monitor["monitor_id"],criteria_id(monitor),monitor["evaluator_version"],row["revision"],item,monitor["criteria"],monitor.get("baseline_refs",[]),gaps)
 
 
-async def scan(ledger, profile, prepare=False, query_limit=None):
-    if not prepare and not ledger.active():
-        return {"status": "inactive_or_expired", **ledger.status()}
-    if ledger.meta("blocked"):
-        return {"status": "blocked", "reason": ledger.meta("blocked")}
-    criteria = criteria_id(profile)
-    ledger.requeue_criteria(criteria)
-    started = time.time()
-    with ledger.db:
-        run = ledger.db.execute("INSERT INTO runs(started,status) VALUES (?,?)", (started, "running")).lastrowid
-    coverage, assessed = [], 0
+def summary_event(ledger, monitor, kind, text, key):
+    mid = monitor["monitor_id"]
+    ledger.enqueue(mid,kind,{"summary":text},digest([mid,kind,key]))
+
+
+def finalize_expiry(ledger, monitor, now=None):
+    now = time.time() if now is None else now
+    mid = monitor["monitor_id"]
+    m = ledger.monitor(mid)
+    if not m or not m["enabled"] or m["stopped"] or m["expires_at"] is None or now < m["expires_at"]:
+        return
+    runs = ledger.run_count(mid)
+    assessments = ledger.db.execute("SELECT count(*) FROM assessments WHERE monitor_id=? AND evaluator_version!='legacy-v1'",(mid,)).fetchone()[0]
+    status = ledger.status(mid)
+    summary_event(ledger,monitor,"final",f"闲鱼监控试运行到期 [{mid}]\n已停止采集与AI调用。完成 {runs} 次巡检，{assessments} 次判断，保留 {status['items']} 个商品的历史。\n到期不代表已买到合适商品；详细数据保留在本机。",m["expires_at"])
+
+
+async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyzer=None, cache=None):
+    mid = monitor["monitor_id"]
+    if not monitor.get("enabled",True) or (not prepare and not ledger.active(mid)):
+        return {"status":"inactive_or_expired",**ledger.status(mid)}
+    if ledger.meta("blocked") or ledger.monitor(mid)["blocked"]:
+        return {"status":"blocked","monitor_id":mid,"reason":"platform_boundary"}
+    mode = "prepare" if prepare else "live"
+    run = ledger.start_run(mid,mode)
+    prior = ledger.run_count(mid,mode)
+    coverage, analyzed, details = [], 0, 0
     status, error = "ok", None
+    cache = {} if cache is None else cache
+    initial = not prepare and prior == 0 and monitor["notification_policy"].get("initial_baseline_only",True)
+    budget = {k:monitor["analysis_budget"][k] for k in ("input_chars","output_tokens")}
     try:
-        deadline = profile.get("timeout", 600)
+        analyzer = analyzer or Analyzer(ChatTransport(runtime["ai"],ledger),budget=budget)
+        deadline = monitor["scan_budget"]["timeout"]
         if not prepare:
-            deadline = min(deadline, float(ledger.meta("expires_at")) - started)
+            deadline = min(deadline,ledger.monitor(mid)["expires_at"]-time.time())
         async with asyncio.timeout(deadline):
-            async with Browser(profile["reader_file"], profile["cdp"]) as browser:
-                watch_ids = [str(i["id"]) for i in profile.get("seeds", []) if i["decision"] == "watch"]
-                items, entry = await browser.favorites(watch_ids)
-                coverage.append(entry)
-                for item in items:
-                    ledger.observe(item, "favorites", criteria)
-                if entry["missing"]:
-                    status = "partial"
-                # Alternate newest and native markdown listings; dates do not determine identity.
-                prior_runs = ledger.db.execute("SELECT count(*) FROM runs WHERE status IN ('ok','partial')").fetchone()[0]
-                sort = "新降价" if prior_runs % 3 == 2 else "新发布"
-                queries = profile["queries"][:query_limit] if query_limit else profile["queries"]
-                for query in queries:
-                    window = "最新" if prior_runs % 7 == 6 else "3天内"
-                    items, entry = await browser.search(query["keyword"], profile.get("pages", 2), sort, window)
+            async with Browser(runtime["reader_file"],runtime["cdp"]) as browser:
+                watch = monitor.get("watch_items",[])
+                if watch:
+                    items, entry = await browser.favorites(watch)
                     coverage.append(entry)
                     for item in items:
-                        pending = ledger.observe(item, query["keyword"], criteria)
-                        if pending:
-                            # Cheap list triage caches non-candidates; detail budget serves worthwhile leads.
-                            decision, reason = judge(item, profile)
-                            if decision == "reserve":
-                                ledger.assess(item["id"], decision, reason, criteria)
-                # Existing detail evidence is refreshed round-robin; never exceed the shared budget.
-                pending = ledger.pending(profile.get("detail_limit", 3))
-                for row in pending:
-                    detail = await browser.detail(row["id"])
-                    ledger.observe(detail, "detail", criteria)
-                    current = ledger.db.execute("SELECT snapshot FROM items WHERE id=?", (row["id"],)).fetchone()
-                    decision, reason = judge(json.loads(current["snapshot"]), profile)
-                    ledger.assess(row["id"], decision, reason, criteria, notify=decision == "candidate")
-                    assessed += 1
-                remaining = profile.get("detail_limit", 3) - assessed
-                if remaining and watch_ids:
-                    offset = int(ledger.meta("watch_offset") or 0)
-                    for j in range(min(remaining, len(watch_ids))):
-                        item_id = watch_ids[(offset + j) % len(watch_ids)]
-                        detail = await browser.detail(item_id)
-                        changed = ledger.observe(detail, "watch_detail", criteria)
-                        if changed:
-                            row = ledger.db.execute("SELECT snapshot FROM items WHERE id=?", (item_id,)).fetchone()
-                            decision, reason = judge(json.loads(row["snapshot"]), profile)
-                            ledger.assess(item_id, decision, reason, criteria, notify=decision == "candidate")
-                            assessed += 1
-                    ledger.meta("watch_offset", offset + min(remaining, len(watch_ids)))
+                        ledger.observe(mid,item,"favorites")
+                    if entry.get("missing"):
+                        status = "partial"
+                queries = monitor["queries"][:query_limit] if query_limit else monitor["queries"]
+                if query_limit and len(queries)<len(monitor["queries"]):
+                    coverage.append({"source":"budget","query_limit":query_limit,"truncated":True})
+                sort = "新降价" if prior % 3 == 2 else "新发布"
+                window = "最新" if prior % 7 == 6 else "3天内"
+                for query in queries:
+                    key = (query["keyword"],monitor["scan_budget"]["pages"],sort,window)
+                    if key not in cache:
+                        cache[key] = await browser.search(*key)
+                    items, entry = cache[key]
+                    coverage.append(entry)
+                    for item in items:
+                        ledger.observe(mid,item,query["keyword"])
+                # Rule triage every pending relation, independent of the scarce detail/AI budget.
+                for row in ledger.pending(mid,100000):
+                    item = json.loads(row["snapshot"])
+                    decision, reason = triage(item,monitor)
+                    if decision == "rejected":
+                        ledger.assess(mid,row["id"],AnalysisResult("rejected",reason,analysis_source="rule"),criteria_id(monitor),monitor["evaluator_version"])
+                    else:
+                        with ledger.db:
+                            ledger.db.execute("UPDATE monitor_items SET priority=? WHERE monitor_id=? AND item_key=?",(prioritize(item,monitor),mid,row["item_key"]))
+                # One rotating watch refresh cannot consume the exploration allocation.
+                if watch and monitor["scan_budget"]["details"]>monitor["analysis_budget"]["calls"]:
+                    wid = watch[prior % len(watch)]
+                    fact = await browser.detail(wid)
+                    ledger.observe(mid,fact,"watch_detail")
+                    details += 1
+                queue = ledger.pending(mid,monitor["analysis_budget"]["calls"])
+                for row in queue:
+                    if details >= monitor["scan_budget"]["details"] or analyzed >= monitor["analysis_budget"]["calls"]:
+                        break
+                    try:
+                        fact = await browser.detail(row["id"])
+                        ledger.observe(mid,fact,"detail")
+                        details += 1
+                        request = input_for(ledger,monitor,row["id"])
+                        decision, reason = triage(request.item,monitor)
+                        if decision == "rejected":
+                            result = AnalysisResult("rejected",reason,analysis_source="rule")
+                        else:
+                            analyzed += 1  # Failed calls also consume this run's call allocation.
+                            result = await analyzer.analyze(request)
+                        notify = result.decision == "candidate" and not prepare and not initial and ledger.active(mid)
+                        ledger.assess(mid,row["id"],result,request.criteria_hash,request.evaluator_version,request.item_revision,notify)
+                    except (AnalysisError,ValueError) as exc:
+                        ledger.mark_error(mid,row["id"],type(exc).__name__)
+                        status = "partial"
     except Exception as exc:
-        # Preserve completed observations, mark partial coverage; never report an empty successful scan.
-        status, error = "failed", type(exc).__name__ + ":" + str(exc)[:120]
-        if any(word in str(exc) for word in ("boundary", "login", "challenge")):
-            ledger.meta("blocked", error)
+        status, error = "failed", type(exc).__name__
+        detail = str(exc)
+        if re.fullmatch(r"[a-z_]{1,80}", detail) and detail.startswith(("visible_","platform_","page_","search_","detail_","image_","favorite_","expected_","invalid_api_","network_not_idle","owned_target_")):
+            error += ":" + detail
+        if any(mark in detail for mark in ("platform_boundary","visible_login_or_challenge","LOGIN","SESSION_EXPIRED","VALIDATE","RGV","BAXIA")):
+            ledger.meta("blocked","platform_boundary")
+            with ledger.db:
+                ledger.db.execute("UPDATE monitors SET blocked='platform_boundary' WHERE monitor_id=?",(mid,))
     with ledger.db:
-        ledger.db.execute("UPDATE runs SET completed=?,status=?,coverage=? WHERE id=?", (time.time(), status, json.dumps(coverage, ensure_ascii=False), run))
-    return {"status": status, "error": error, "run": run, "coverage": coverage, "assessed": assessed, "seconds": round(time.time() - started, 1), **ledger.status()}
+        ledger.db.execute("UPDATE runs SET completed=?,status=?,coverage=?,analyses=?,details=?,error=? WHERE id=?",(time.time(),status,json.dumps(coverage,ensure_ascii=False),analyzed,details,error,run))
+    if not prepare and status == "ok":
+        state = ledger.status(mid)
+        if prior == 0:
+            expiry = datetime.fromtimestamp(state['expires_at'],ZoneInfo(monitor['schedule']['timezone'])).isoformat(timespec='minutes')
+            summary_event(ledger,monitor,"startup",f"闲鱼商品监控：{monitor['duration_days']}天试运行已启动 [{mid}]\n本轮 {len(queries)} 个查询，详情 {details} 条，AI {analyzed} 次；已见 {state['items']} 个商品。\n首次安静建立基线；只有值得核实的新候选或重要变化才提醒。\n每天 {monitor['schedule']['time']}（{monitor['schedule']['timezone']}），截止 {expiry}。\n覆盖有限搜索页，不代表全市场；图片未检，商品质量须另行核实。",ledger.monitor(mid)["activated_at"])
+        elif (prior+1)%7 == 0:
+            summary_event(ledger,monitor,"heartbeat",f"闲鱼监控周报 [{mid}]\n累计成功巡检 {prior+1} 次；已见 {state['items']} 项，待复评 {state['pending']} 项。没有通知不代表没运行。",(prior+1)//7)
+    return {"status":status,"monitor_id":mid,"mode":mode,"run_id":run,"coverage":coverage,"analyses":analyzed,"details":details,"error":error,**ledger.status(mid)}
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Cubi daily read-only shortlist monitor. No daemon, browser launch, login export or purchase.")
-    parser.add_argument("--profile", required=True)
-    parser.add_argument("--database", required=True)
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("seed")
-    commands.add_parser("status")
-    commands.add_parser("activate", help="Start the immutable 14-day window; does not install a scheduler")
-    commands.add_parser("stop")
-    commands.add_parser("unblock", help="Explicitly permit one new attempt after manual login/challenge recovery")
-    scan_args = commands.add_parser("scan")
-    scan_args.add_argument("--prepare", action="store_true", help="Authorized one-shot preactivation read; no sends")
-    scan_args.add_argument("--query-limit", type=int, choices=range(1, 9))
-    flush_args = commands.add_parser("flush", help="Explicit send through Cubi telegram-send.sh")
-    flush_args.add_argument("--notify", action="store_true", required=True)
-    retry = commands.add_parser("reconcile-send", help="Resolve one ambiguous send; do not automatically resend")
-    retry.add_argument("event")
-    retry.add_argument("--result", choices=("sent", "retry"), required=True)
-    decision_args = commands.add_parser("decision")
-    decision_args.add_argument("item_id")
-    decision_args.add_argument("--decision", choices=("watch", "reserve", "rejected", "candidate"), required=True)
-    decision_args.add_argument("--reason", required=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config",required=True)
+    parser.add_argument("--database",required=True)
+    parser.add_argument("--monitor")
+    commands = parser.add_subparsers(dest="command",required=True)
+    for name in ("register","status","activate","stop","resume","unblock","health","run"):
+        commands.add_parser(name)
+    capture = commands.add_parser("scan")
+    capture.add_argument("--prepare",action="store_true")
+    capture.add_argument("--query-limit",type=int,choices=range(1,9))
+    send = commands.add_parser("flush")
+    send.add_argument("--notify",required=True,action="store_true")
+    reconcile = commands.add_parser("reconcile-send")
+    reconcile.add_argument("event")
+    reconcile.add_argument("--result",choices=("sent","retry"),required=True)
     args = parser.parse_args(argv)
-    profile = load_profile(args.profile)
+    config = load_config(args.config)
     path = Path(args.database)
     if not path.parent.is_dir():
         raise ValueError("database_parent_missing")
+    selected = [m for m in config["monitors"] if not args.monitor or m["monitor_id"] == args.monitor]
+    if not selected or (args.command in ("activate","stop","resume","unblock","reconcile-send") and len(selected) != 1):
+        raise ValueError("explicit_single_monitor_required")
     os.umask(0o077)
-    with open(str(path) + ".lock", "a") as lock:
+    with open(str(path)+".lock","a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
-            print(json.dumps({"status": "already_running"}))
+            print(json.dumps({"status":"already_running"}))
             return 0
         ledger = Ledger(path)
         try:
-            result = None
-            if args.command == "seed":
-                ledger.seed(profile.get("seeds", []), criteria_id(profile))
-            elif args.command == "activate":
-                ledger.activate()
-            elif args.command == "stop":
-                ledger.meta("stopped", "1")
-            elif args.command == "unblock":
-                with ledger.db:
-                    ledger.db.execute("DELETE FROM meta WHERE key='blocked'")
-            elif args.command == "scan":
-                result = asyncio.run(scan(ledger, profile, args.prepare, args.query_limit))
-            elif args.command == "flush":
-                result = {"sent": flush(ledger, profile["sender"])}
-            elif args.command == "reconcile-send":
-                with ledger.db:
-                    ledger.db.execute("UPDATE outbox SET status=? WHERE event=? AND status='uncertain'", ("sent" if args.result == "sent" else "pending", args.event))
-            elif args.command == "decision":
-                ledger.assess(args.item_id, args.decision, args.reason, criteria_id(profile))
-            print(json.dumps(result or ledger.status(), ensure_ascii=False))
-            return 1 if result and result.get("status") in ("failed", "partial", "blocked") else 0
+            for m in config["monitors"]:
+                ledger.register(m,criteria_id(m))
+            results, cache = [], {}
+            for m in selected:
+                mid = m["monitor_id"]
+                result = None
+                if args.command == "activate":
+                    ledger.activate(mid)
+                elif args.command == "stop":
+                    with ledger.db:
+                        ledger.db.execute("UPDATE monitors SET stopped=1 WHERE monitor_id=?",(mid,))
+                elif args.command == "resume":
+                    ledger.resume(mid)
+                elif args.command == "unblock":
+                    with ledger.db:
+                        ledger.db.execute("DELETE FROM meta WHERE key='blocked'")
+                        ledger.db.execute("UPDATE monitors SET blocked=NULL WHERE monitor_id=?",(mid,))
+                elif args.command in ("scan","run"):
+                    finalize_expiry(ledger,m)
+                    result = asyncio.run(scan(ledger,m,config["runtime"],getattr(args,"prepare",False),getattr(args,"query_limit",None),cache=cache))
+                    if args.command == "run":
+                        result["delivery"] = flush(ledger,mid,config["runtime"]["sender"])
+                elif args.command == "flush":
+                    result = flush(ledger,mid,config["runtime"]["sender"])
+                elif args.command == "health":
+                    result = ledger.health(mid)
+                elif args.command == "reconcile-send":
+                    with ledger.db:
+                        ledger.db.execute("UPDATE outbox SET status=? WHERE monitor_id=? AND event=? AND status='uncertain'",("sent" if args.result == "sent" else "pending",mid,args.event))
+                results.append(result or ledger.status(mid))
+            print(json.dumps(results,ensure_ascii=False))
+            return int(any(r.get("status") in ("failed","partial","blocked","degraded") or r.get("delivery",{}).get("uncertain") or r.get("delivery",{}).get("retry") for r in results))
         finally:
             ledger.close()
 

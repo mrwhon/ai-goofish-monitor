@@ -5,7 +5,7 @@ status: Ready
 assignee:
   - '@codex'
 created_date: '2026-10-11 11:59'
-updated_date: '2026-10-11 12:00'
+updated_date: '2026-10-11 12:39'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -19,16 +19,16 @@ ordinal: 1000
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 共享商品事实而任务判断独立；两个品类配置与两个任务同商品测试通过
-- [ ] #2 schema1历史数据、议价、观察、决定与通知状态迁移保真并失败回滚；变化复评和队列预算公平
-- [ ] #3 采集区分空结果、截断、登录风控和解析失败，只关闭自有页面
-- [ ] #4 AI适配器有界、保留证据缺口、失败可重试；通知outbox独立且确认送达才标sent
-- [ ] #5 CLI支持prepare/live隔离、不可延长期限、停止到期、互斥、健康检查和运行恢复；定向测试与文档通过
+- [x] #1 共享商品事实而任务判断独立；两个品类配置与两个任务同商品测试通过
+- [x] #2 schema1历史数据、议价、观察、决定与通知状态迁移保真并失败回滚；变化复评和队列预算公平
+- [x] #3 采集区分空结果、截断、登录风控和解析失败，只关闭自有页面
+- [x] #4 AI适配器有界、保留证据缺口、失败可重试；通知outbox独立且确认送达才标sent
+- [x] #5 CLI支持prepare/live隔离、不可延长期限、停止到期、互斥、健康检查和运行恢复；定向测试与文档通过
 <!-- AC:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 调查发现均有处置依据，剩余事项已明确承接
+- [x] #1 调查发现均有处置依据，剩余事项已明确承接
 <!-- DOD:END -->
 
 ## Implementation Plan
@@ -41,4 +41,6 @@ ordinal: 1000
 
 <!-- SECTION:NOTES:BEGIN -->
 F1旧原型items混入任务判断；F2未知规则被reserve缓存；F3prepare污染live cadence；F4上游Web/API认证风险，本任务独立CLI不启动Web、不导出cookie。全部范围内实施。源原型24项在2026-10-11重新通过，仅作为迁移输入和采集前置基线，不代表通用核心已完成。
+
+已验收通用schema2核心：182项离线测试通过；真实schema1库已备份并迁移，legacy任务disabled保留历史，pc-workstation显式导入两基准，10500议价与11388网页价独立。真实prepare完成2页59条、4详情、3次DeepSeek文本AI，实际served_model=deepseek-flash，预留费用累计US$0.0235374/上限3；混合套餐价与带卡/无卡口径均保留缺口。15条已判断真实快照在内存数据库回放，0新判断/0新outbox；变化复评与多任务合成测试通过。F1改为共享facts+任务关系；F2未知进入有界AI；F3prepare/live轮次隔离；F4不启动上游Web/API，认证风险接口未采用；F5新降价真实为直接点击，已修复68采集测试并完成现场新发布2页60条/新降价1页30条/详情11388，全部24用户页面原样保留，只关闭自有target。通知成功/明确失败/不明与互斥、停用、原期限内resume、到期均有测试。两worker已ff整合；源代码验收候选可部署，Cubi实际service/timer与个人Telegram送达由CUB-059持有。
 <!-- SECTION:NOTES:END -->

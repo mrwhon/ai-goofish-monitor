@@ -47,6 +47,20 @@ def validate_config(config):
             raise ValueError("invalid_watch_id")
         if not isinstance(m["baseline_refs"], list) or len(m["baseline_refs"]) > 10:
             raise ValueError("invalid_baselines")
+        for baseline in m["baseline_refs"]:
+            if not isinstance(baseline,dict) or not isinstance(baseline.get("item"),dict):
+                raise ValueError("invalid_baseline")
+            item = baseline["item"]
+            if not str(item.get("id","")).isdigit() or not isinstance(item.get("title"),str) or not item["title"].strip():
+                raise ValueError("invalid_baseline_item")
+            for field,value in (("baseline_price",item.get("price")),("quote",baseline.get("quote",1))):
+                if type(value) not in (int,float) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"invalid_{field}")
+        for field in ("min_price","max_price"):
+            if field in m["criteria"]:
+                value = m["criteria"][field]
+                if type(value) not in (int,float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid_price_bound")
         m.setdefault("duration_days", 14)
         integer(m["duration_days"], 1, 90, "duration")
         s = m.setdefault("schedule", {"timezone": "Asia/Taipei", "time": "10:30"})

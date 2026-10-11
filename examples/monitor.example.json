@@ -1,0 +1,37 @@
+{
+  "schema": 2,
+  "runtime": {
+    "reader_file": "/absolute/path/to/agent-browser-read.py",
+    "cdp": "http://127.0.0.1:9222",
+    "sender": "/absolute/path/to/confirmed-sender",
+    "ai": {
+      "url": "https://api.example.invalid/chat/completions",
+      "model": "configured-model",
+      "key_env": "MONITOR_AI_KEY",
+      "cost_cap_usd": 3,
+      "input_usd_per_million_ceiling": 1,
+      "output_usd_per_million_ceiling": 2
+    }
+  },
+  "monitors": [
+    {
+      "monitor_id": "camera-example",
+      "enabled": false,
+      "queries": [{"keyword": "旅行相机"}],
+      "criteria": {"goal": "旅行摄影，完整售价低于同口径已确认基准", "max_price": 5000},
+      "baseline_refs": [{"item": {"id": "111111111", "title": "合成基准相机（测试数据）", "price": 4000}, "source": "synthetic example, replace before activation"}],
+      "watch_items": [],
+      "schedule": {"timezone": "Asia/Taipei", "time": "10:30"},
+      "duration_days": 14
+    },
+    {
+      "monitor_id": "desk-example",
+      "enabled": false,
+      "queries": [{"keyword": "书桌"}],
+      "criteria": {"goal": "小书房书桌，尺寸与运费需核实", "max_price": 1200},
+      "baseline_refs": [{"item": {"id": "222222222", "title": "合成书桌（测试数据）", "price": 1000}, "source": "synthetic example, replace before activation"}],
+      "watch_items": [],
+      "duration_days": 14
+    }
+  ]
+}

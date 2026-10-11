@@ -4,6 +4,8 @@
 
 基于 Playwright 和 AI 的闲鱼多任务实时监控，提供完整的 Web 管理界面。
 
+本 fork 的独立通用 CLI 模式见 [监控核心与操作合同](docs/cubi-monitor.md)，配置样例包含两种合成商品。Cubi 接入采用该模式，不启动上游 Web/API。
+
 
 ## 核心特性
 
