@@ -1,11 +1,11 @@
 ---
 id: GFM-001
 title: 通用闲鱼监控核心：持久去重、任务隔离与有界AI复评
-status: Ready
+status: Done
 assignee:
   - '@codex'
 created_date: '2026-10-11 11:59'
-updated_date: '2026-10-11 12:39'
+updated_date: '2026-10-11 12:42'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -44,3 +44,9 @@ F1旧原型items混入任务判断；F2未知规则被reserve缓存；F3prepare�
 
 已验收通用schema2核心：182项离线测试通过；真实schema1库已备份并迁移，legacy任务disabled保留历史，pc-workstation显式导入两基准，10500议价与11388网页价独立。真实prepare完成2页59条、4详情、3次DeepSeek文本AI，实际served_model=deepseek-flash，预留费用累计US$0.0235374/上限3；混合套餐价与带卡/无卡口径均保留缺口。15条已判断真实快照在内存数据库回放，0新判断/0新outbox；变化复评与多任务合成测试通过。F1改为共享facts+任务关系；F2未知进入有界AI；F3prepare/live轮次隔离；F4不启动上游Web/API，认证风险接口未采用；F5新降价真实为直接点击，已修复68采集测试并完成现场新发布2页60条/新降价1页30条/详情11388，全部24用户页面原样保留，只关闭自有target。通知成功/明确失败/不明与互斥、停用、原期限内resume、到期均有测试。两worker已ff整合；源代码验收候选可部署，Cubi实际service/timer与个人Telegram送达由CUB-059持有。
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+已交付配置驱动的通用闲鱼监控核心：schema2迁移保真、多任务判断隔离、去重与变化复评、有界文本AI、独立outbox及停止恢复/期限/互斥。182离线测试通过；真实新发布/新降价/详情与24页面保留通过，实际AI三次通过，同快照回放零重复事件。Cubi CUB-059承接实际调度和个人通知运行验收，14天效果观察不能作为当前已完成结果。核心代码c23d787。
+<!-- SECTION:FINAL_SUMMARY:END -->
