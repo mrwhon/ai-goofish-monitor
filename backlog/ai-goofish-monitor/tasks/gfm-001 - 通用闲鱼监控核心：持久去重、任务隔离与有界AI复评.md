@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@codex'
 created_date: '2026-10-11 11:59'
-updated_date: '2026-10-11 12:42'
+updated_date: '2026-10-11 12:46'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -40,9 +40,7 @@ ordinal: 1000
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-F1旧原型items混入任务判断；F2未知规则被reserve缓存；F3prepare污染live cadence；F4上游Web/API认证风险，本任务独立CLI不启动Web、不导出cookie。全部范围内实施。源原型24项在2026-10-11重新通过，仅作为迁移输入和采集前置基线，不代表通用核心已完成。
-
-已验收通用schema2核心：182项离线测试通过；真实schema1库已备份并迁移，legacy任务disabled保留历史，pc-workstation显式导入两基准，10500议价与11388网页价独立。真实prepare完成2页59条、4详情、3次DeepSeek文本AI，实际served_model=deepseek-flash，预留费用累计US$0.0235374/上限3；混合套餐价与带卡/无卡口径均保留缺口。15条已判断真实快照在内存数据库回放，0新判断/0新outbox；变化复评与多任务合成测试通过。F1改为共享facts+任务关系；F2未知进入有界AI；F3prepare/live轮次隔离；F4不启动上游Web/API，认证风险接口未采用；F5新降价真实为直接点击，已修复68采集测试并完成现场新发布2页60条/新降价1页30条/详情11388，全部24用户页面原样保留，只关闭自有target。通知成功/明确失败/不明与互斥、停用、原期限内resume、到期均有测试。两worker已ff整合；源代码验收候选可部署，Cubi实际service/timer与个人Telegram送达由CUB-059持有。
+F1旧原型items混入任务判断；F2未知规则被reserve缓存；F3prepare污染live cadence；F4上游Web/API认证风险，本任务独立CLI不启动Web、不导出cookie。源原型24项重新通过，仅为迁移与采集前置基线。F1已改为共享facts+任务关系；F2未知进入有界AI；F3prepare/live轮次隔离；F4按用户界面后置边界不采用上游接口。通用schema2核心182项离线测试通过；真实旧库备份迁移保真，legacy disabled、当前任务显式映射导入，网页标价和人工议价独立。prepare有界采集/真实文本AI通过，模型与费用回执只留私人账本，套餐混合报价及带卡/无卡比较均保留缺口。已判断真实快照在内存数据库回放零新判断/零事件；变化复评、多任务、通知成功/明确失败/不明、互斥、停止、原期限内resume与到期测试通过。F5新降价现场为直接点击，已修复68采集测试并完成新发布/新降价/详情联合验证，只关闭自有target、原页面保留。两worker已ff整合并验收；临时工作树已按生命周期移除，提交从master可恢复。核心c23d787，Cubi实际service/timer、私人购买基准与个人Telegram验收唯一由CUB-059持有；公开工具任务不维护真实商品明细和议价。
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
