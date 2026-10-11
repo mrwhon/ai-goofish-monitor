@@ -135,8 +135,10 @@ class Locator:
 
     async def click(self, **kwargs):
         self.page.clicks.append(self.name)
-        if self.name in ("新发布", "新降价"):
+        if self.name == "新发布":
             self.page.menu_open = True
+        elif self.name == "新降价":
+            self.page.browser.responses = [Response(self.page.discount_payload or self.page.payloads[self.page.index])]
         elif self.name == NEXT_SELECTOR:
             self.page.index += 1
             self.page.browser.responses = [Response(self.page.payloads[self.page.index])]
@@ -159,6 +161,8 @@ class Page:
         self.next_count, self.next_enabled = 1, True
         self.option_count = 1
         self.menu_open = False
+        self.discount_payload = None
+        self.matched_responses = []
         self.clicks, self.listeners, self.cards = [], {}, []
         self.expected_ids_read = None
 
@@ -175,8 +179,10 @@ class Page:
             async def __aenter__(self):
                 return self
             async def __aexit__(self, *args):
-                if not any(predicate(response) for response in page.browser.responses):
+                matches = [response for response in page.browser.responses if predicate(response)]
+                if not matches:
                     raise asyncio.TimeoutError("expected response missing")
+                page.matched_responses.extend(matches)
         return Expectation()
 
     async def wait_for_load_state(self, *args, **kwargs):
@@ -223,7 +229,6 @@ def fast_waits(monkeypatch):
 @pytest.mark.parametrize("sort,window,clicks", [
     ("新发布", "3天内", ["新发布", "3天内"]),
     ("新发布", "最新", ["新发布", "最新"]),
-    ("新降价", "3天内", ["新降价", "最新"]),
 ])
 def test_filter_menu_opens_before_selecting_option(sort, window, clicks):
     browser = fake_browser([fixture("search")])
@@ -234,6 +239,22 @@ def test_filter_menu_opens_before_selecting_option(sort, window, clicks):
     assert result.coverage["pages"] == 1 and result.coverage["has_next"] is False
     assert result.coverage["truncated"] is False
     assert browser.reader.boundary_calls == 3
+
+
+def test_price_reduction_is_direct_sort_without_publish_dropdown():
+    browser = fake_browser([fixture("search")])
+    browser.page.discount_payload = envelope([listing("789")], nextPage=False)
+    result = asyncio.run(browser.search("离线词", pages=1, sort="新降价", publish_window="3天内"))
+    assert browser.page.clicks == ["新降价"]
+    assert browser.page.menu_open is False
+    assert asyncio.run(browser.page.get_by_text("最新", exact=True).count()) == 0
+    assert [item["id"] for item in result.items] == ["789"]
+    assert result.coverage["filter"] == "新降价" and result.coverage["window"] is None
+    assert len(browser.page.matched_responses) == 1
+    response = browser.page.matched_responses[0]
+    assert response.request.method == "POST"
+    assert f"/h5/{SEARCH_API}/1.0/" in response.url
+    assert browser.reader.boundary_calls == 2
 
 
 def test_filter_click_cannot_reuse_response_captured_before_click(monkeypatch):

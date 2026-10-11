@@ -282,19 +282,23 @@ class Browser:
         if sort == "新发布" and publish_window not in ("最新", "1天内", "3天内", "7天内", "14天内"):
             raise ValueError("invalid_publish_window")
         await self.navigate("https://www.goofish.com/search?" + urlencode({"q": keyword}))
-        window = publish_window if sort == "新发布" else "最新" if sort else None
+        window = publish_window if sort == "新发布" else None
         if sort:
             menu = self.page.get_by_text(sort, exact=True)
             if await menu.count() != 1:
                 raise CaptureError("search_sort_selector_changed")
-            # Opening the menu is not evidence that the desired filter was applied.
-            await menu.click(timeout=5000)
-            await self.boundary()
-            option = self.page.get_by_text(window, exact=True)
-            await option.wait_for(state="visible", timeout=5000)
-            if await option.count() != 1:
-                raise CaptureError("search_filter_option_changed")
-            await self.settle_click(option)
+            if sort == "新发布":
+                # Opening the menu is not evidence that the desired filter was applied.
+                await menu.click(timeout=5000)
+                await self.boundary()
+                option = self.page.get_by_text(window, exact=True)
+                await option.wait_for(state="visible", timeout=5000)
+                if await option.count() != 1:
+                    raise CaptureError("search_filter_option_changed")
+                await self.settle_click(option)
+            else:
+                # Native price-reduction sorting applies on a single click.
+                await self.settle_click(menu)
         items = {}
         coverage = {"keyword": keyword, "filter": sort, "window": window, "pages": 0,
                     "requested_pages": pages, "bounded": True, "skipped_cards": 0,
