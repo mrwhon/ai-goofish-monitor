@@ -219,6 +219,25 @@ def fake_browser(payloads=None):
     return browser
 
 
+@pytest.mark.parametrize("fault", [None, "missing_api", "bad_api", "challenge", "different_error"])
+def test_network_idle_fallback_requires_current_valid_api_and_safe_page(fault):
+    browser = fake_browser()
+    async def navigate(page, url, args):
+        page.url = url
+        if fault != "missing_api":
+            browser.responses = [Response(envelope([listing()], nextPage=False) if fault != "bad_api" else {"ret": ["ERROR"]})]
+        if fault == "challenge":
+            page.body = "请完成验证"
+        raise RuntimeError("different_error" if fault == "different_error" else "network_not_idle")
+    browser.reader.navigate = navigate
+    if fault is None:
+        asyncio.run(browser.navigate("https://www.goofish.com/search?q=synthetic"))
+        assert browser.settlement_fallbacks == 1 and browser.reader.boundary_calls == 2
+    else:
+        with pytest.raises((RuntimeError, CaptureError)):
+            asyncio.run(browser.navigate("https://www.goofish.com/search?q=synthetic"))
+
+
 @pytest.fixture(autouse=True)
 def fast_waits(monkeypatch):
     async def no_sleep(seconds):

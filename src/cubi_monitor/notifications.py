@@ -4,6 +4,8 @@ import json
 import subprocess
 import time
 
+from .policy import triage
+
 
 def message(body):
     body = json.loads(body) if isinstance(body,str) else body
@@ -12,8 +14,10 @@ def message(body):
     esc = lambda value: html.escape(str(value))
     quote = f"；已知议价 {esc(body['quote'])} 元（未重新确认）" if body.get("quote") is not None else ""
     gaps = "；".join(body.get("evidence_gaps", []))
-    return (f"闲鱼待核实候选 [{esc(body.get('monitor_id',''))}]\n{esc(body.get('title','')[:250])}\n"
-            f"标价 {esc(body.get('price'))} 元{quote}\n{esc(body.get('reason','')[:650])}\n"
+    kind = {"watch_price_drop":"关注商品降价", "price_drop":"降价候选", "newly_discovered":"首次发现候选", "updated":"变化候选"}.get(body.get("change_kind"), "待核实候选")
+    previous = f"；此前标价 {esc(body['previous_price'])} 元" if body.get("previous_price") is not None else ""
+    return (f"闲鱼{kind} [{esc(body.get('monitor_id',''))}]\n{esc(body.get('title','')[:250])}\n"
+            f"标价 {esc(body.get('price'))} 元{previous}{quote}\n{esc(body.get('reason','')[:650])}\n"
             f"比较：{esc(body.get('comparison','')[:900])}\n缺口：{esc(gaps[:500])}\n{esc(body.get('url',''))}")
 
 
@@ -34,6 +38,15 @@ def flush(ledger, mid, sender, now=None):
             body = json.loads(event["body"])
             current = ledger.item(mid,body["id"])
             if not current or current["pending"] or current["decision"] != "candidate" or body.get("criteria") != monitor["criteria_hash"] or body.get("evaluator_version") != monitor["evaluator_version"] or body.get("fingerprint") != current["revision"]:
+                with ledger.db:
+                    ledger.db.execute("UPDATE outbox SET status='superseded' WHERE event=?",(event["event"],))
+                counts["superseded"] += 1
+                continue
+        elif event["kind"] == "price_change":
+            body = json.loads(event["body"])
+            current = ledger.item(mid,body["id"])
+            snapshot = json.loads(current["snapshot"]) if current else {}
+            if not current or triage(snapshot, json.loads(monitor["config"]))[0] == "rejected" or body.get("criteria") != monitor["criteria_hash"] or body.get("price") != snapshot.get("price"):
                 with ledger.db:
                     ledger.db.execute("UPDATE outbox SET status='superseded' WHERE event=?",(event["event"],))
                 counts["superseded"] += 1

@@ -227,7 +227,23 @@ class Browser:
 
     async def navigate(self, url):
         self.responses.clear()
-        await self.reader.navigate(self.page, url, SimpleNamespace(ready_selector=None, busy_selector=None))
+        try:
+            await self.reader.navigate(self.page, url, SimpleNamespace(ready_selector=None, busy_selector=None))
+        except Exception as exc:
+            # Persistent telemetry can prevent global network idle. Only accept a
+            # current, valid page API result after the same strict boundary checks.
+            path = urlsplit(url).path
+            api = DETAIL_API if path == "/item" else SEARCH_API if path == "/search" else None
+            if str(exc) != "network_not_idle" or api is None:
+                raise
+            await self.boundary()
+            payload = await self.payload(api)
+            if api == SEARCH_API:
+                parse_search_checked(payload)
+            else:
+                parse_detail(payload, parse_qs(urlsplit(url).query)["id"][0])
+            self.settlement_fallbacks = getattr(self, "settlement_fallbacks", 0)+1
+            await asyncio.sleep(2.2)
         await self.boundary()
 
     async def boundary(self):
@@ -274,7 +290,7 @@ class Browser:
             raise CaptureError("search_next_page_control_disabled")
         return enabled, locator if enabled else None
 
-    async def search(self, keyword, pages=2, sort="新发布", publish_window="3天内"):
+    async def search(self, keyword, pages=1, sort="新发布", publish_window="3天内"):
         if type(pages) is not int or not 1 <= pages <= 2:
             raise ValueError("invalid_search_pages")
         if sort not in ("新发布", "新降价", None, ""):

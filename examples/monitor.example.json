@@ -18,7 +18,16 @@
       "monitor_id": "camera-example",
       "enabled": false,
       "queries": [{"keyword": "旅行相机"}],
-      "criteria": {"goal": "旅行摄影，完整售价低于同口径已确认基准", "max_price": 5000},
+      "criteria": {
+        "goal": "旅行摄影，完整售价低于同口径已确认基准",
+        "max_price": 5000,
+        "defer_below_price": 100,
+        "rules": [
+          {"pattern": "相机", "ceiling": 4000, "group": "camera", "fields": ["title"]},
+          {"pattern": "镜头", "ceiling": 2000, "group": "lens", "fields": ["title"]}
+        ]
+      },
+      "search_policy": {"sorts": ["新发布", "新降价"], "publish_window": "3天内", "sweep_every": 7},
       "baseline_refs": [{"item": {"id": "111111111", "title": "合成基准相机（测试数据）", "price": 4000}, "source": "synthetic example, replace before activation"}],
       "watch_items": [],
       "schedule": {"timezone": "Asia/Taipei", "time": "10:30"},

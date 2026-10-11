@@ -16,17 +16,46 @@ from .config import load_config
 from .contracts import AnalysisError, AnalysisInput, AnalysisResult
 from .ledger import Ledger, digest
 from .notifications import flush, message
-from .policy import criteria_id, triage
+from .policy import criteria_id, matching_rule, triage
 from .transport import ChatTransport
 
 
 def prioritize(item, monitor):
-    text = item.get("title", "")+" "+item.get("description", "")
-    for rule in monitor["criteria"].get("rules", []):
-        if re.search(rule["pattern"], text, re.I):
-            price, ceiling = item.get("price"), rule.get("ceiling")
-            return max(.1, 2-price/ceiling) if price is not None and ceiling else 1
+    rule = matching_rule(item, monitor["criteria"])
+    if rule:
+        price, ceiling = item.get("price"), rule.get("ceiling")
+        return max(.1, 2-price/ceiling) if price is not None and ceiling else 1
     return 0
+
+
+def search_plan(monitor, prior, query_limit=None):
+    queries = monitor["queries"][:query_limit] if query_limit else monitor["queries"]
+    offset = prior % len(queries)
+    queries = queries[offset:] + queries[:offset]
+    policy = monitor["search_policy"]
+    every = policy["sweep_every"]
+    sweep = every > 0 and (prior+1) % every == 0
+    plan, remaining = [], monitor["scan_budget"]["total_pages"]
+    # Interleave sorts by query, rotating priority when a budget truncates coverage.
+    for index, query in enumerate(queries):
+        for sort in policy["sorts"]:
+            wanted = 2 if sweep and index == 0 else monitor["scan_budget"]["pages"]
+            pages = min(wanted, remaining)
+            plan.append({"keyword": query["keyword"], "sort": sort, "pages": pages, "requested_pages": wanted, "window": "最新" if sweep and index == 0 else policy["publish_window"]})
+            remaining -= pages
+    return plan
+
+
+def rule_triage(ledger, monitor, row):
+    item = json.loads(row["snapshot"])
+    decision, reason = triage(item, monitor)
+    mid = monitor["monitor_id"]
+    if decision == "rejected":
+        ledger.assess(mid,row["id"],AnalysisResult("rejected",reason,analysis_source="rule"),criteria_id(monitor),monitor["evaluator_version"])
+    else:
+        with ledger.db:
+            ledger.db.execute("UPDATE monitor_items SET priority=?,pending=CASE WHEN ?='deferred' THEN 'awaiting_price' ELSE pending END WHERE monitor_id=? AND item_key=?", (prioritize(item, monitor),decision,mid,row["item_key"]))
+    return decision
 
 
 def input_for(ledger, monitor, item_id):
@@ -71,6 +100,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
     run = ledger.start_run(mid,mode)
     prior = ledger.run_count(mid,mode)
     coverage, analyzed, details = [], 0, 0
+    detail_cache = {}
     status, error = "ok", None
     cache = {} if cache is None else cache
     initial = not prepare and prior == 0 and monitor["notification_policy"].get("initial_baseline_only",True)
@@ -87,56 +117,66 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                     items, entry = await browser.favorites(watch)
                     coverage.append(entry)
                     for item in items:
-                        ledger.observe(mid,item,"favorites")
+                        ledger.observe(mid,item,"favorites",notify_changes=not prepare and not initial)
                     if entry.get("missing"):
                         status = "partial"
                 queries = monitor["queries"][:query_limit] if query_limit else monitor["queries"]
                 if query_limit and len(queries)<len(monitor["queries"]):
                     coverage.append({"source":"budget","query_limit":query_limit,"truncated":True})
-                sort = "新降价" if prior % 3 == 2 else "新发布"
-                window = "最新" if prior % 7 == 6 else "3天内"
-                for query in queries:
-                    key = (query["keyword"],monitor["scan_budget"]["pages"],sort,window)
+                for entry_plan in search_plan(monitor,prior,query_limit):
+                    query, pages, sort, window = entry_plan["keyword"], entry_plan["pages"], entry_plan["sort"], entry_plan["window"]
+                    if not pages:
+                        coverage.append({"keyword":query,"filter":sort,"pages":0,"truncated":True,"stop_reason":"total_page_budget"})
+                        continue
+                    key = (query,pages,sort,window)
                     if key not in cache:
                         cache[key] = await browser.search(*key)
                     items, entry = cache[key]
-                    coverage.append(entry)
+                    coverage.append({**entry,"keyword":query,"filter":sort,"requested_pages":entry_plan["requested_pages"],"budget_truncated":pages < entry_plan["requested_pages"]})
                     for item in items:
-                        ledger.observe(mid,item,query["keyword"])
+                        ledger.observe(mid,item,query,notify_changes=not prepare and not initial)
                 # Rule triage every pending relation, independent of the scarce detail/AI budget.
-                for row in ledger.pending(mid,100000):
-                    item = json.loads(row["snapshot"])
-                    decision, reason = triage(item,monitor)
-                    if decision == "rejected":
-                        ledger.assess(mid,row["id"],AnalysisResult("rejected",reason,analysis_source="rule"),criteria_id(monitor),monitor["evaluator_version"])
-                    else:
-                        with ledger.db:
-                            ledger.db.execute("UPDATE monitor_items SET priority=? WHERE monitor_id=? AND item_key=?",(prioritize(item,monitor),mid,row["item_key"]))
+                for row in ledger.triage_rows(mid,monitor["scan_budget"]["triage_items"]):
+                    rule_triage(ledger,monitor,row)
                 # One rotating watch refresh cannot consume the exploration allocation.
                 if watch and monitor["scan_budget"]["details"]>monitor["analysis_budget"]["calls"]:
                     wid = watch[prior % len(watch)]
                     fact = await browser.detail(wid)
-                    ledger.observe(mid,fact,"watch_detail")
+                    detail_cache[wid] = fact
+                    ledger.observe(mid,fact,"watch_detail",notify_changes=not prepare and not initial)
                     details += 1
                 queue = ledger.pending(mid,monitor["analysis_budget"]["calls"])
                 for row in queue:
                     if details >= monitor["scan_budget"]["details"] or analyzed >= monitor["analysis_budget"]["calls"]:
                         break
                     try:
-                        fact = await browser.detail(row["id"])
-                        ledger.observe(mid,fact,"detail")
-                        details += 1
+                        if rule_triage(ledger,monitor,row) in ("rejected", "deferred"):
+                            continue
+                        if row["id"] in detail_cache:
+                            fact = detail_cache[row["id"]]
+                        else:
+                            fact = await browser.detail(row["id"])
+                            detail_cache[row["id"]] = fact
+                            details += 1
+                        pending = ledger.observe(mid,fact,"detail",notify_changes=not prepare and not initial)
+                        if pending is None:
+                            continue  # List changes resolved to the exact already-assessed detail.
                         request = input_for(ledger,monitor,row["id"])
                         decision, reason = triage(request.item,monitor)
                         if decision == "rejected":
                             result = AnalysisResult("rejected",reason,analysis_source="rule")
+                        elif decision == "deferred":
+                            rule_triage(ledger,monitor,ledger.item(mid,row["id"]))
+                            continue
                         else:
                             analyzed += 1  # Failed calls also consume this run's call allocation.
                             result = await analyzer.analyze(request)
                         notify = result.decision == "candidate" and not prepare and not initial and ledger.active(mid)
                         ledger.assess(mid,row["id"],result,request.criteria_hash,request.evaluator_version,request.item_revision,notify)
                     except (AnalysisError,ValueError) as exc:
-                        ledger.mark_error(mid,row["id"],type(exc).__name__)
+                        detail = str(exc).split(":", 1)[0]
+                        safe = detail if re.fullmatch(r"[a-z_]{1,80}", detail) else type(exc).__name__
+                        ledger.mark_error(mid,row["id"],safe)
                         status = "partial"
     except Exception as exc:
         status, error = "failed", type(exc).__name__
@@ -155,7 +195,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
             expiry = datetime.fromtimestamp(state['expires_at'],ZoneInfo(monitor['schedule']['timezone'])).isoformat(timespec='minutes')
             summary_event(ledger,monitor,"startup",f"闲鱼商品监控：{monitor['duration_days']}天试运行已启动 [{mid}]\n本轮 {len(queries)} 个查询，详情 {details} 条，AI {analyzed} 次；已见 {state['items']} 个商品。\n首次安静建立基线；只有值得核实的新候选或重要变化才提醒。\n每天 {monitor['schedule']['time']}（{monitor['schedule']['timezone']}），截止 {expiry}。\n覆盖有限搜索页，不代表全市场；图片未检，商品质量须另行核实。",ledger.monitor(mid)["activated_at"])
         elif (prior+1)%7 == 0:
-            summary_event(ledger,monitor,"heartbeat",f"闲鱼监控周报 [{mid}]\n累计成功巡检 {prior+1} 次；已见 {state['items']} 项，待复评 {state['pending']} 项。没有通知不代表没运行。",(prior+1)//7)
+            summary_event(ledger,monitor,"heartbeat",f"闲鱼监控周报 [{mid}]\n累计成功巡检 {prior+1} 次；已见 {state['items']} 项，待复评 {state['pending']} 项（待有效报价 {state['awaiting_price']}）。\n本轮AI {analyzed} 次；详情 {details} 条；截断来源 {sum(bool(e.get('truncated') or e.get('budget_truncated')) for e in coverage)} 个。没有通知不代表没运行。",(prior+1)//7)
     return {"status":status,"monitor_id":mid,"mode":mode,"run_id":run,"coverage":coverage,"analyses":analyzed,"details":details,"error":error,**ledger.status(mid)}
 
 

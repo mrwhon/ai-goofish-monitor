@@ -8,6 +8,8 @@ from pathlib import Path
 import sqlite3
 import time
 
+from .policy import matching_rule, price_crossed
+
 STABLE = ("title", "description", "seller_id", "images", "availability")
 LEGACY_ID = "legacy-purchase-review"
 
@@ -167,8 +169,8 @@ class Ledger:
         with self.db:
             self.db.execute("INSERT INTO monitors(monitor_id,config,criteria_hash,evaluator_version,enabled) VALUES(?,?,?,?,?) ON CONFLICT(monitor_id) DO UPDATE SET config=excluded.config,criteria_hash=excluded.criteria_hash,evaluator_version=excluded.evaluator_version,enabled=excluded.enabled", (mid,encoded(monitor),criteria_hash,monitor["evaluator_version"],int(monitor.get("enabled",True))))
             if old and (old["criteria_hash"] != criteria_hash or old["evaluator_version"] != monitor["evaluator_version"]):
-                self.db.execute("UPDATE monitor_items SET pending='criteria_changed' WHERE monitor_id=?", (mid,))
-                self.db.execute("UPDATE outbox SET status='superseded' WHERE monitor_id=? AND kind='candidate' AND status='pending'", (mid,))
+                self.db.execute("UPDATE monitor_items SET pending=CASE WHEN assessed_snapshot IS NULL THEN 'new' ELSE 'criteria_changed' END WHERE monitor_id=?", (mid,))
+                self.db.execute("UPDATE outbox SET status='superseded' WHERE monitor_id=? AND kind IN('candidate','price_change') AND status='pending'", (mid,))
         for baseline in monitor.get("baseline_refs", []):
             item = baseline.get("item", {})
             if not item:
@@ -221,12 +223,13 @@ class Ledger:
         m = self.monitor(mid)
         return bool(m and m["enabled"] and not m["stopped"] and m["activated_at"] is not None and m["activated_at"] <= now < m["expires_at"])
 
-    def observe(self, mid, item, source, now=None):
+    def observe(self, mid, item, source, now=None, notify_changes=False):
         now = time.time() if now is None else now
         item = validate_item(item)
         key = item["platform"]+":"+item["id"]
         old = self.db.execute("SELECT * FROM items WHERE item_key=?",(key,)).fetchone()
         snapshot = json.loads(old["snapshot"]) if old else {}
+        previous_price = snapshot.get("price")
         # A list heading often truncates the actual description-derived detail title.
         if old and source not in ("detail","watch_detail") and "description" in snapshot:
             item.pop("title", None)
@@ -251,11 +254,21 @@ class Ledger:
                     elif snapshot.get("price") is not None and assessed.get("price") is not None:
                         previous = assessed["price"]
                         threshold = criteria.get("price_change_fraction",.05)
-                        ceiling = criteria.get("max_price")
-                        crossing = ceiling is not None and (previous > ceiling) != (snapshot["price"] > ceiling)
+                        crossing = price_crossed(snapshot, previous, snapshot["price"], criteria)
                         if crossing or (previous > 0 and abs(snapshot["price"]/previous-1) >= threshold-1e-9) or (previous == 0 and snapshot["price"] != 0):
                             pending = "price_changed"
+                elif pending == "awaiting_price" and item.get("price") is not None and item["price"] != previous_price:
+                    pending = "new"
                 self.db.execute("UPDATE monitor_items SET pending=? WHERE monitor_id=? AND item_key=?",(pending,relation["monitor_id"],key))
+                # Only the scanning task can notify; shared facts never send for another task.
+                config = json.loads(relation["config"])
+                current_price = snapshot.get("price")
+                if notify_changes and relation["monitor_id"] == mid and relation["watch"] and self.active(mid, now) and config.get("notification_policy", {}).get("watch_price_changes", True) and previous_price and current_price is not None and current_price < previous_price:
+                    criteria = config.get("criteria", {})
+                    significant = current_price / previous_price <= 1-criteria.get("price_change_fraction", .05)+1e-9 or price_crossed(snapshot, previous_price, current_price, criteria)
+                    if significant:
+                        body = {"monitor_id": mid, "id": str(item["id"]), "title": snapshot.get("title", ""), "price": current_price, "previous_price": previous_price, "quote": relation["quote"], "fingerprint": revision, "criteria": relation["wanted_criteria"], "url": f"https://www.goofish.com/item?id={item['id']}", "change_kind": "watch_price_drop", "reason": "关注商品标价下降；议价与标价独立，未确认健康或成交价", "comparison": "变化提醒，尚非购买推荐", "evidence_gaps": ["商品状态与图片需核实"]}
+                        self.enqueue(mid, "price_change", body, digest([mid,key,"price_change",revision,relation["wanted_criteria"]]), key, now=now, commit=False)
         return self.item(mid,item["id"])["pending"]
 
     def item(self, mid, item_id):
@@ -276,7 +289,8 @@ class Ledger:
             self.db.execute("UPDATE monitor_items SET pending=NULL,assessed_snapshot=?,assessed_revision=?,criteria_hash=?,evaluator_version=?,decision=?,reason=?,error=NULL WHERE monitor_id=? AND item_key=?",(row["snapshot"],row["revision"],criteria_hash,evaluator_version,data["decision"],data["reason"],mid,row["item_key"]))
             if notify:
                 snapshot = json.loads(row["snapshot"])
-                body = {"monitor_id":mid,"id":str(item_id),"fingerprint":row["revision"],"criteria":criteria_hash,"evaluator_version":evaluator_version,"title":snapshot.get("title", ""),"price":snapshot.get("price"),"quote":row["quote"],"url":f"https://www.goofish.com/item?id={item_id}",**data}
+                change = "price_drop" if row["pending"] == "price_changed" and row["assessed_snapshot"] and snapshot.get("price", float('inf')) < json.loads(row["assessed_snapshot"]).get("price", float('inf')) else "updated" if row["assessed_snapshot"] else "newly_discovered"
+                body = {"monitor_id":mid,"id":str(item_id),"fingerprint":row["revision"],"criteria":criteria_hash,"evaluator_version":evaluator_version,"title":snapshot.get("title", ""),"price":snapshot.get("price"),"quote":row["quote"],"published_at":snapshot.get("published_at"),"change_kind":change,"url":f"https://www.goofish.com/item?id={item_id}",**data}
                 self.enqueue(mid,"candidate",body,digest([mid,row["item_key"],row["revision"],criteria_hash,evaluator_version]),row["item_key"],seq,now,commit=False)
         return seq
 
@@ -289,17 +303,52 @@ class Ledger:
         with self.db:
             self.db.execute("UPDATE monitor_items SET attempted_at=?,error=? WHERE monitor_id=? AND item_key=?", (time.time() if now is None else now,error[:160],mid,"goofish:"+str(item_id)))
 
+    def triage_rows(self, mid, limit=500):
+        # Streaming, keyset-bounded cheap triage; never materialize the whole historical pool.
+        cursor, remaining = self.meta("triage_cursor:"+mid) or "", limit
+        wrapped = not bool(cursor)
+        while remaining:
+            rows = self.db.execute("SELECT i.*,mi.* FROM items i JOIN monitor_items mi USING(item_key) WHERE mi.monitor_id=? AND mi.pending IS NOT NULL AND mi.pending!='awaiting_price' AND mi.item_key>? ORDER BY mi.item_key LIMIT ?", (mid,cursor,min(100,remaining))).fetchall()
+            if not rows:
+                if wrapped:
+                    cursor = ""
+                    break
+                cursor, wrapped = "", True
+                continue
+            for row in rows:
+                yield dict(row)
+            cursor = rows[-1]["item_key"]
+            remaining -= len(rows)
+        self.meta("triage_cursor:"+mid, cursor)
+
     def pending(self, mid, limit=3):
-        rows = [dict(r) for r in self.db.execute("SELECT i.*,mi.* FROM items i JOIN monitor_items mi USING(item_key) WHERE mi.monitor_id=? AND mi.pending IS NOT NULL ORDER BY mi.attempted_at IS NOT NULL,mi.attempted_at,mi.priority DESC,i.first_seen DESC,i.id",(mid,))]
-        changed = [r for r in rows if r["pending"] != "new"]
-        unknown = [r for r in rows if r["pending"] == "new" and r["priority"] <= 0]
-        plausible = [r for r in rows if r["pending"] == "new" and r["priority"] > 0]
+        config = json.loads(self.monitor(mid)["config"])
+        criteria = config.get("criteria", {})
+        def group(raw):
+            rule = matching_rule(json.loads(raw), criteria)
+            return rule.get("group", "plausible") if rule else "unknown"
+        self.db.create_function("monitor_group", 1, group)
+        groups = list(dict.fromkeys(r.get("group", "plausible") for r in criteria.get("rules", [])))
+        if not groups:
+            groups = ["plausible"]
+        offset = self.run_count(mid) % len(groups)
+        groups = groups[offset:] + groups[:offset]
+        lanes = [("mi.pending!='new'", [])] + [("mi.pending='new' AND monitor_group(i.snapshot)=?", [g]) for g in groups] + [("mi.pending='new' AND mi.priority<=0", [])]
+        # Periodically give unknown categories a slot even when all configured groups are busy.
+        if self.run_count(mid) % 3 == 2:
+            lanes.insert(1, lanes.pop())
         chosen = []
-        for lane in (changed,plausible,unknown):
-            if lane and len(chosen) < limit:
-                chosen.append(lane[0])
-        keys = {r["item_key"] for r in chosen}
-        return (chosen + [r for r in rows if r["item_key"] not in keys])[:limit]
+        def select(condition, params, count):
+            keys = [r["item_key"] for r in chosen]
+            omitted = " AND mi.item_key NOT IN ("+",".join("?" for _ in keys)+")" if keys else ""
+            return [dict(r) for r in self.db.execute("SELECT i.*,mi.* FROM items i JOIN monitor_items mi USING(item_key) WHERE mi.monitor_id=? AND mi.pending IS NOT NULL AND mi.pending!='awaiting_price' AND ("+condition+")"+omitted+" ORDER BY mi.attempted_at IS NOT NULL,mi.attempted_at,mi.priority DESC,i.first_seen DESC,i.id LIMIT ?", [mid,*params,*keys,count])]
+        for condition, params in lanes:
+            if len(chosen) >= limit:
+                break
+            chosen.extend(select(condition,params,1))
+        if len(chosen) < limit:
+            chosen.extend(select("1", [], limit-len(chosen)))
+        return chosen
 
     def start_run(self, mid, mode, now=None):
         with self.db:
@@ -321,4 +370,4 @@ class Ledger:
 
     def status(self, mid):
         m = self.monitor(mid)
-        return {"monitor_id":mid,"items":self.db.execute("SELECT count(*) FROM monitor_items WHERE monitor_id=?",(mid,)).fetchone()[0],"pending":self.db.execute("SELECT count(*) FROM monitor_items WHERE monitor_id=? AND pending IS NOT NULL",(mid,)).fetchone()[0],"outbox":{r[0]:r[1] for r in self.db.execute("SELECT status,count(*) FROM outbox WHERE monitor_id=? GROUP BY status",(mid,))},"activated_at":m["activated_at"] if m else None,"expires_at":m["expires_at"] if m else None,"active":self.active(mid),"blocked":m["blocked"] if m else None}
+        return {"monitor_id":mid,"items":self.db.execute("SELECT count(*) FROM monitor_items WHERE monitor_id=?",(mid,)).fetchone()[0],"pending":self.db.execute("SELECT count(*) FROM monitor_items WHERE monitor_id=? AND pending IS NOT NULL AND pending!='awaiting_price'",(mid,)).fetchone()[0],"awaiting_price":self.db.execute("SELECT count(*) FROM monitor_items WHERE monitor_id=? AND pending='awaiting_price'",(mid,)).fetchone()[0],"outbox":{r[0]:r[1] for r in self.db.execute("SELECT status,count(*) FROM outbox WHERE monitor_id=? GROUP BY status",(mid,))},"activated_at":m["activated_at"] if m else None,"expires_at":m["expires_at"] if m else None,"active":self.active(mid),"blocked":m["blocked"] if m else None}
