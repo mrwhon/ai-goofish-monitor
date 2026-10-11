@@ -1,0 +1,9 @@
+{
+  "ret": ["SUCCESS::调用成功"],
+  "data": {
+    "itemDO": {"itemId": "123", "desc": "测试详情", "price": "￥1.2万", "imageInfos": [{"url": "https://example.test/detail.jpg?token=fake"}]},
+    "sellerDO": {"sellerId": "987"},
+    "cookie": "synthetic_cookie_do_not_return",
+    "accessToken": "synthetic_token_do_not_return"
+  }
+}

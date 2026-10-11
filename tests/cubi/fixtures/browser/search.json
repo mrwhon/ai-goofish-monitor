@@ -1,0 +1,14 @@
+{
+  "ret": ["SUCCESS::调用成功"],
+  "data": {
+    "resultList": [
+      {"data": {"item": {"main": {
+        "exContent": {"itemId": "123", "title": "离线测试电脑", "price": [{"text": "当前价"}, {"text": "¥"}, {"text": "1.05"}, {"text": "万"}], "picUrl": "https://example.test/image.jpg?token=fake#fragment"},
+        "clickParam": {"args": {"publishTime": "1000"}}
+      }}}},
+      {"cardType": "ad", "data": {"advertisement": "synthetic ad marker"}},
+      {"data": {"item": {"main": {"exContent": {"itemId": "456", "title": "未标价格的商品", "price": "面议"}}}}}
+    ],
+    "nextPage": false
+  }
+}
