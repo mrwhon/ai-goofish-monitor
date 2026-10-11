@@ -1,4 +1,4 @@
-"""Read public listing fields from normal page traffic; never sign API calls."""
+"""Read normal page traffic; explicitly authorized favorites use only the UI."""
 import asyncio
 import importlib.util
 import math
@@ -10,6 +10,7 @@ from .contracts import CaptureBatch
 
 SEARCH_API = "mtop.taobao.idlemtopsearch.pc.search"
 DETAIL_API = "mtop.taobao.idle.pc.detail"
+LOGIN_API = "mtop.taobao.idlemessage.pc.loginuser.get"
 NEXT_SELECTOR = "button[class*='search-pagination-arrow-container']:has([class*='search-pagination-arrow-right'])"
 
 
@@ -172,7 +173,7 @@ def _is_api_response(response, api=None):
     parts = urlsplit(response.url)
     if parts.scheme != "https" or parts.hostname != "h5api.m.goofish.com" or parts.username or parts.password or response.request.method != "POST":
         return False
-    apis = (api,) if api else (SEARCH_API, DETAIL_API)
+    apis = (api,) if api else (SEARCH_API, DETAIL_API, LOGIN_API)
     return any(re.fullmatch(r"/h5/" + re.escape(name) + r"/[0-9.]+/?", parts.path) for name in apis)
 
 
@@ -343,6 +344,49 @@ class Browser:
             raise ValueError("invalid_item_id")
         await self.navigate(f"https://www.goofish.com/item?id={item_id}")
         return parse_detail(await self.payload(DETAIL_API), item_id)
+
+    async def favorite(self, item_id, account_id, guard, before_click, allow_click=True):
+        """Add one precise listing through its UI; never toggle a saved listing off."""
+        item_id = item_id_value(item_id)
+        if not item_id or not item_id_value(account_id):
+            raise ValueError("invalid_collection_identity")
+        await self.detail(item_id)
+        await self.boundary()
+
+        async def verify():
+            parts = urlsplit(self.page.url)
+            if parts.scheme != "https" or parts.hostname != "www.goofish.com" or parts.path != "/item":
+                raise CaptureError("collection_target_changed")
+            current = checked_payload(await self.payload(LOGIN_API)).get("userId")
+            if isinstance(current, bool) or item_id_value(current) != str(account_id):
+                raise CaptureError("collection_account_mismatch")
+            return parse_detail(await self.payload(DETAIL_API), item_id)
+
+        fact = await verify()
+        if not guard(fact):
+            return "stale"
+        saved = self.page.get_by_text("已收藏", exact=True)
+        add = self.page.get_by_text("收藏", exact=True)
+        if await saved.count() == 1 and await add.count() == 0:
+            return "already_saved"
+        if await add.count() != 1 or await saved.count() != 0:
+            raise CaptureError("collection_control_changed")
+        if not allow_click:
+            return "unconfirmed"
+        await asyncio.sleep(2.2)
+        await self.boundary()
+        if not guard(await verify()) or not before_click():
+            return "stale"
+        # A changed UI cannot turn this into an unfavorite click.
+        if await saved.count() != 0 or await add.count() != 1:
+            raise CaptureError("collection_control_changed")
+        await add.click(timeout=5000)
+        await asyncio.sleep(2.2)
+        await self.boundary()
+        await verify()
+        if await saved.count() != 1 or await add.count() != 0:
+            raise CaptureError("collection_result_unconfirmed")
+        return "added"
 
     async def favorites(self, expected_ids):
         expected_ids = {item_id_value(value) for value in expected_ids}

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .analysis import Analyzer
 from .browser import Browser, CaptureError
+from .collection import collect_candidates
 from .config import load_config
 from .contracts import AnalysisError, AnalysisInput, AnalysisResult
 from .ledger import Ledger, digest
@@ -102,6 +103,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
     coverage, analyzed, details = [], 0, 0
     detail_cache = {}
     status, error = "ok", None
+    collection = None
     cache = {} if cache is None else cache
     initial = not prepare and prior == 0 and monitor["notification_policy"].get("initial_baseline_only",True)
     budget = {k:monitor["analysis_budget"][k] for k in ("input_chars","output_tokens")}
@@ -113,6 +115,10 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
         async with asyncio.timeout(deadline):
             async with Browser(runtime["reader_file"],runtime["cdp"]) as browser:
                 watch = monitor.get("watch_items",[])
+                # Successfully saved candidates become task watches without editing private config.
+                watch = list(dict.fromkeys([*watch, *[r[0] for r in ledger.db.execute(
+                    "SELECT i.id FROM monitor_items m JOIN items i USING(item_key) WHERE m.monitor_id=? AND m.watch=1",
+                    (mid,))]]))
                 if watch:
                     items, entry = await browser.favorites(watch)
                     coverage.append(entry)
@@ -146,8 +152,11 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                     ledger.observe(mid,fact,"watch_detail",notify_changes=not prepare and not initial)
                     details += 1
                 queue = ledger.pending(mid,monitor["analysis_budget"]["calls"])
+                reserved = (min(monitor.get("collection_policy", {}).get("max_per_run", 1),
+                                max(0, monitor["scan_budget"]["details"]-1))
+                            if not prepare and monitor.get("collection_policy", {}).get("enabled") else 0)
                 for row in queue:
-                    if details >= monitor["scan_budget"]["details"] or analyzed >= monitor["analysis_budget"]["calls"]:
+                    if details >= monitor["scan_budget"]["details"]-reserved or analyzed >= monitor["analysis_budget"]["calls"]:
                         break
                     try:
                         if rule_triage(ledger,monitor,row) in ("rejected", "deferred"):
@@ -178,10 +187,16 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                         safe = detail if re.fullmatch(r"[a-z_]{1,80}", detail) else type(exc).__name__
                         ledger.mark_error(mid,row["id"],safe)
                         status = "partial"
+                if not prepare and status == "ok":
+                    collection = await collect_candidates(ledger,monitor,browser,
+                        detail_budget=monitor["scan_budget"]["details"]-details)
+                    details += collection["detail_reads"]
+                    if collection["uncertain"] or collection["failed"]:
+                        status = "partial"
     except Exception as exc:
         status, error = "failed", type(exc).__name__
         detail = str(exc)
-        if re.fullmatch(r"[a-z_]{1,80}", detail) and detail.startswith(("visible_","platform_","page_","search_","detail_","image_","favorite_","expected_","invalid_api_","network_not_idle","owned_target_")):
+        if re.fullmatch(r"[a-z_]{1,80}", detail) and detail.startswith(("visible_","platform_","page_","search_","detail_","image_","favorite_","collection_","expected_","invalid_api_","network_not_idle","owned_target_")):
             error += ":" + detail
         if any(mark in detail for mark in ("platform_boundary","visible_login_or_challenge","LOGIN","SESSION_EXPIRED","VALIDATE","RGV","BAXIA")):
             ledger.meta("blocked","platform_boundary")
@@ -196,7 +211,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
             summary_event(ledger,monitor,"startup",f"闲鱼商品监控：{monitor['duration_days']}天试运行已启动 [{mid}]\n本轮 {len(queries)} 个查询，详情 {details} 条，AI {analyzed} 次；已见 {state['items']} 个商品。\n首次安静建立基线；只有值得核实的新候选或重要变化才提醒。\n每天 {monitor['schedule']['time']}（{monitor['schedule']['timezone']}），截止 {expiry}。\n覆盖有限搜索页，不代表全市场；图片未检，商品质量须另行核实。",ledger.monitor(mid)["activated_at"])
         elif (prior+1)%7 == 0:
             summary_event(ledger,monitor,"heartbeat",f"闲鱼监控周报 [{mid}]\n累计成功巡检 {prior+1} 次；已见 {state['items']} 项，待复评 {state['pending']} 项（待有效报价 {state['awaiting_price']}）。\n本轮AI {analyzed} 次；详情 {details} 条；截断来源 {sum(bool(e.get('truncated') or e.get('budget_truncated')) for e in coverage)} 个。没有通知不代表没运行。",(prior+1)//7)
-    return {"status":status,"monitor_id":mid,"mode":mode,"run_id":run,"coverage":coverage,"analyses":analyzed,"details":details,"error":error,**ledger.status(mid)}
+    return {"status":status,"monitor_id":mid,"mode":mode,"run_id":run,"coverage":coverage,"analyses":analyzed,"details":details,"error":error,"collection":collection,**ledger.status(mid)}
 
 
 def main(argv=None):

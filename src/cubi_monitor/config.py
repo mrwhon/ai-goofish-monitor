@@ -47,6 +47,16 @@ def validate_config(config):
         m.setdefault("watch_items", [])
         if any(not str(i).isdigit() for i in m["watch_items"]):
             raise ValueError("invalid_watch_id")
+        collection = m.setdefault("collection_policy", {})
+        if not isinstance(collection, dict):
+            raise ValueError("invalid_collection_policy")
+        collection.setdefault("enabled", False)
+        collection.setdefault("max_per_run", 1)
+        if type(collection["enabled"]) is not bool:
+            raise ValueError("invalid_collection_enabled")
+        integer(collection["max_per_run"], 1, 3, "collection_budget")
+        if collection["enabled"] and not re.fullmatch(r"[0-9]+", str(collection.get("expected_account_id", ""))):
+            raise ValueError("invalid_collection_account")
         if not isinstance(m["baseline_refs"], list) or len(m["baseline_refs"]) > 10:
             raise ValueError("invalid_baselines")
         for baseline in m["baseline_refs"]:
