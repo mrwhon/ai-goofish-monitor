@@ -63,6 +63,8 @@ def input_for(ledger, monitor, item_id):
     row = ledger.item(monitor["monitor_id"], item_id)
     item = json.loads(row["snapshot"])
     gaps = [name+" 未提供" for name in ("price","description","seller_id","availability") if not item.get(name)]
+    if item.get("availability") == "unknown":
+        gaps.append("在售状态尚未确认")
     item["image_count"] = len(item.pop("images",[]))
     item.pop("thumbnail",None)  # Text transport does not read pixels/URLs.
     if len(item.get("description", "")) > 8000:
@@ -119,13 +121,29 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                 watch = list(dict.fromkeys([*watch, *[r[0] for r in ledger.db.execute(
                     "SELECT i.id FROM monitor_items m JOIN items i USING(item_key) WHERE m.monitor_id=? AND m.watch=1",
                     (mid,))]]))
+                favorite_entry, unresolved, changed_watch = None, set(), []
                 if watch:
-                    items, entry = await browser.favorites(watch)
-                    coverage.append(entry)
+                    try:
+                        items, favorite_entry = await browser.favorites(watch)
+                    except CaptureError as exc:
+                        if str(exc) not in ("favorite_card_schema_changed", "favorite_price_schema_changed", "favorite_duplicate_price_conflict"):
+                            raise
+                        items, favorite_entry = [], {"source": "favorites", "pages": 1, "found": 0,
+                            "missing": watch, "unresolved": watch, "bounded": True, "truncated": True,
+                            "errors": [{"reason": str(exc)}]}
+                    coverage.append(favorite_entry)
+                    unresolved.update([*favorite_entry.get("missing", []), *favorite_entry.get("unresolved", [])])
                     for item in items:
+                        previous = ledger.item(mid,item["id"])
+                        snapshot = json.loads(previous["snapshot"]) if previous else {}
+                        if item.get("price") is not None and item["price"] != snapshot.get("price"):
+                            changed_watch.append(item["id"])
+                            item = {**item, "availability": "unknown"}
+                        elif snapshot.get("availability") == "unknown":
+                            changed_watch.append(item["id"])
                         ledger.observe(mid,item,"favorites",notify_changes=not prepare and not initial)
-                    if entry.get("missing"):
-                        status = "partial"
+                    for wid in unresolved:
+                        ledger.observe(mid,{"id":wid,"availability":"unknown"},"favorites")
                 queries = monitor["queries"][:query_limit] if query_limit else monitor["queries"]
                 if query_limit and len(queries)<len(monitor["queries"]):
                     coverage.append({"source":"budget","query_limit":query_limit,"truncated":True})
@@ -144,18 +162,47 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                 # Rule triage every pending relation, independent of the scarce detail/AI budget.
                 for row in ledger.triage_rows(mid,monitor["scan_budget"]["triage_items"]):
                     rule_triage(ledger,monitor,row)
-                # One rotating watch refresh cannot consume the exploration allocation.
-                if watch and monitor["scan_budget"]["details"]>monitor["analysis_budget"]["calls"]:
-                    wid = watch[prior % len(watch)]
-                    fact = await browser.detail(wid)
-                    detail_cache[wid] = fact
-                    ledger.observe(mid,fact,"watch_detail",notify_changes=not prepare and not initial)
-                    details += 1
+                # Unclear/changed watches get the spare detail budget before routine rotation.
+                collection_slots = (monitor.get("collection_policy", {}).get("max_per_run", 1)
+                                    if not prepare and monitor.get("collection_policy", {}).get("enabled") else 0)
+                watch_slots = max(0,monitor["scan_budget"]["details"]-monitor["analysis_budget"]["calls"]-collection_slots)
+                targets = sorted(unresolved)
+                if targets:
+                    # Partial rounds must rotate too; success-only cadence can starve another bad card.
+                    attempts = ledger.db.execute("SELECT count(*) FROM runs WHERE monitor_id=? AND mode=?",(mid,mode)).fetchone()[0]-1
+                    offset = attempts % len(targets)
+                    targets = targets[offset:]+targets[:offset]
+                targets = list(dict.fromkeys([*targets,*changed_watch,*([watch[prior % len(watch)]] if watch else [])]))
+                resolved, failed_watches = set(), set()
+                for wid in targets[:watch_slots]:
+                    details += 1  # Failed reads also consume the detail allocation.
+                    try:
+                        fact = await browser.detail(wid)
+                        detail_cache[wid] = fact
+                        ledger.observe(mid,fact,"watch_detail",notify_changes=not prepare and not initial)
+                        rule_triage(ledger,monitor,ledger.item(mid,wid))
+                        if fact.get("price") is not None:
+                            resolved.add(wid)
+                    except (CaptureError,ValueError) as exc:
+                        if any(mark in str(exc).upper() for mark in ("PLATFORM_BOUNDARY","VISIBLE_","LOGIN","VALIDATE","RGV","BAXIA")):
+                            raise
+                        coverage.append({"source":"watch_detail","id":wid,"error":type(exc).__name__,"truncated":True})
+                        failed_watches.add(wid)
+                        status = "partial"
+                if favorite_entry is not None:
+                    favorite_entry["resolved_by_detail"] = sorted(unresolved & resolved)
+                    favorite_entry["unresolved_after_detail"] = sorted(unresolved-resolved)
+                    unconfirmed = [wid for wid in dict.fromkeys([*changed_watch,*unresolved]) if json.loads(ledger.item(mid,wid)["snapshot"]).get("availability") == "unknown"]
+                    favorite_entry["unconfirmed_status"] = unconfirmed
+                    if unresolved-resolved or unconfirmed or favorite_entry.get("skipped_cards"):
+                        status = "partial"
                 queue = ledger.pending(mid,monitor["analysis_budget"]["calls"])
                 reserved = (min(monitor.get("collection_policy", {}).get("max_per_run", 1),
                                 max(0, monitor["scan_budget"]["details"]-1))
                             if not prepare and monitor.get("collection_policy", {}).get("enabled") else 0)
                 for row in queue:
+                    if row["id"] in failed_watches:
+                        continue
                     if details >= monitor["scan_budget"]["details"]-reserved or analyzed >= monitor["analysis_budget"]["calls"]:
                         break
                     try:

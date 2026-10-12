@@ -37,11 +37,13 @@ def flush(ledger, mid, sender, now=None):
         if event["kind"] == "candidate":
             body = json.loads(event["body"])
             current = ledger.item(mid,body["id"])
-            if not current or current["pending"] or current["decision"] != "candidate" or body.get("criteria") != monitor["criteria_hash"] or body.get("evaluator_version") != monitor["evaluator_version"] or body.get("fingerprint") != current["revision"]:
+            if not current or triage(json.loads(current["snapshot"]), json.loads(monitor["config"]))[0] == "rejected" or current["pending"] or current["decision"] != "candidate" or body.get("criteria") != monitor["criteria_hash"] or body.get("evaluator_version") != monitor["evaluator_version"] or body.get("fingerprint") != current["revision"]:
                 with ledger.db:
                     ledger.db.execute("UPDATE outbox SET status='superseded' WHERE event=?",(event["event"],))
                 counts["superseded"] += 1
                 continue
+            if json.loads(current["snapshot"]).get("availability") == "unknown":
+                continue  # Keep pending until a bounded detail read confirms the current state.
         elif event["kind"] == "price_change":
             body = json.loads(event["body"])
             current = ledger.item(mid,body["id"])
@@ -50,6 +52,8 @@ def flush(ledger, mid, sender, now=None):
                 with ledger.db:
                     ledger.db.execute("UPDATE outbox SET status='superseded' WHERE event=?",(event["event"],))
                 counts["superseded"] += 1
+                continue
+            if snapshot.get("availability") == "unknown":
                 continue
         with ledger.db:
             claimed = ledger.db.execute("UPDATE outbox SET status='uncertain',attempts=attempts+1 WHERE event=? AND status='pending'",(event["event"],)).rowcount

@@ -207,3 +207,27 @@ def test_account_is_rechecked_immediately_before_click(monkeypatch):
     with pytest.raises(CaptureError,match='collection_account_mismatch'):
         asyncio.run(b.favorite('123','77',lambda f:True,lambda:pytest.fail('intent')))
     assert b.page.clicks==0
+
+
+@pytest.mark.parametrize('state',['卖掉了','已下架','无法识别的新状态'])
+def test_ui_unavailable_state_never_collects(monkeypatch,state):
+    b=ui_browser(monkeypatch);original=b.payload
+    async def status(api):
+        value=await original(api)
+        if api!=LOGIN_API:value['data']['itemDO']['itemStatusStr']=state
+        return value
+    b.payload=status
+    assert asyncio.run(b.favorite('123','77',lambda f:True,lambda:pytest.fail('intent')))=='stale'
+    assert b.page.clicks==0
+
+
+def test_sale_between_assessment_and_collection_refreshes_ledger(setup,monkeypatch):
+    ledger,m=setup;b=ui_browser(monkeypatch);original=b.payload
+    async def status(api):
+        value=await original(api)
+        if api!=LOGIN_API:value['data']['itemDO']['itemStatusStr']='卖掉了'
+        return value
+    b.payload=status
+    assert asyncio.run(collect_candidates(ledger,m,b))['stale']==1
+    assert json.loads(ledger.item('camera','123')['snapshot'])['availability']=='sold'
+    assert ledger.item('camera','123')['pending'] and not b.page.clicks

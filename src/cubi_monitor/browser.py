@@ -151,6 +151,10 @@ def parse_detail(payload, expected_id):
         price = price_value(item.get("price"))
     if price is not None:
         result["price"] = price
+    if "itemStatusStr" in item:
+        result["availability"] = {"在线": "available", "卖掉了": "sold", "已卖出": "sold",
+            "已售出": "sold", "已下架": "unavailable", "下架": "unavailable",
+            "已删除": "unavailable"}.get(str(item["itemStatusStr"]), "unknown")
     return result
 
 
@@ -363,7 +367,7 @@ class Browser:
             return parse_detail(await self.payload(DETAIL_API), item_id)
 
         fact = await verify()
-        if not guard(fact):
+        if not guard(fact) or fact.get("availability") in ("sold", "unavailable", "unknown"):
             return "stale"
         saved = self.page.get_by_text("已收藏", exact=True)
         add = self.page.get_by_text("收藏", exact=True)
@@ -375,7 +379,8 @@ class Browser:
             return "unconfirmed"
         await asyncio.sleep(2.2)
         await self.boundary()
-        if not guard(await verify()) or not before_click():
+        refreshed = await verify()
+        if not guard(refreshed) or refreshed.get("availability") in ("sold", "unavailable", "unknown") or not before_click():
             return "stale"
         # A changed UI cannot turn this into an unfavorite click.
         if await saved.count() != 0 or await add.count() != 1:
@@ -394,7 +399,8 @@ class Browser:
             raise ValueError("invalid_item_id")
         coverage = {"source": "favorites", "found": 0, "expected": len(expected_ids),
                     "missing": sorted(expected_ids), "pages": 0, "bounded": True,
-                    "empty": True, "has_next": False, "truncated": False, "skipped_cards": 0}
+                    "empty": True, "has_next": False, "truncated": False, "skipped_cards": 0,
+                    "unresolved": [], "errors": []}
         if not expected_ids:
             return CaptureBatch([], coverage)
         await self.navigate("https://www.goofish.com/collection")
@@ -402,27 +408,35 @@ class Browser:
         cards = await self.page.locator('a[href*="/item?"]').evaluate_all("""(els, ids) => els.filter(e => {
             const u = new URL(e.href); return u.hostname === 'www.goofish.com' &&
                 u.pathname === '/item' && ids.includes(u.searchParams.get('id'));
-        }).map(e => ({href:e.href, text:e.innerText}))""", sorted(expected_ids))
-        items = {}
+        }).map(e => ({href:e.href, current_prices:
+            [...e.querySelectorAll('[class^="priceLeft--"]')].map(p => p.innerText)}))""", sorted(expected_ids))
+        items, found, unresolved = {}, set(), set()
         for card in cards:
             if not isinstance(card, dict) or not isinstance(card.get("href"), str):
-                raise CaptureError("favorite_card_schema_changed")
+                coverage["skipped_cards"] += 1
+                coverage["errors"].append({"reason": "favorite_card_schema_changed"})
+                continue
             parts = urlsplit(card["href"])
             ids = parse_qs(parts.query).get("id", [])
             if parts.hostname != "www.goofish.com" or parts.path != "/item" or len(ids) != 1 or ids[0] not in expected_ids:
                 continue
             item_id = ids[0]
-            if not isinstance(card.get("text"), str):
-                raise CaptureError("favorite_card_schema_changed")
-            prices = re.findall(r"[¥￥]\s*[0-9][0-9,]*(?:\.[0-9]+)?\s*万?\s*元?", card["text"])
-            values = {price_value(price) for price in prices}
+            found.add(item_id)
+            prices = card.get("current_prices")
+            values = {price_value(price) for price in prices} if isinstance(prices, list) and all(isinstance(p, str) for p in prices) else set()
             if len(values) != 1 or None in values:
-                raise CaptureError("favorite_price_schema_changed")
+                unresolved.add(item_id)
+                coverage["errors"].append({"id": item_id, "reason": "favorite_price_schema_changed"})
+                continue
             item = {"id": item_id, "platform": "goofish", "price": values.pop()}
             if item_id in items and items[item_id] != item:
-                raise CaptureError("favorite_duplicate_price_conflict")
+                unresolved.add(item_id)
+                coverage["errors"].append({"id": item_id, "reason": "favorite_duplicate_price_conflict"})
+                continue
             items[item_id] = item
-        found = set(items)
+        for item_id in unresolved:
+            items.pop(item_id, None)
         coverage.update(found=len(found), missing=sorted(expected_ids - found), pages=1,
-                        empty=not items, truncated=bool(expected_ids - found))
+                        empty=not found, unresolved=sorted(unresolved),
+                        truncated=bool(expected_ids - found or unresolved or coverage["skipped_cards"]))
         return CaptureBatch(list(items.values()), coverage)

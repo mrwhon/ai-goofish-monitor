@@ -267,6 +267,74 @@ class FakeAnalyzer:
         return AnalysisResult("reserve","需核实",comparison="缺少完整规格",evidence_gaps=["图片未检查"])
 
 
+@pytest.mark.parametrize("case,expected",[("recovered","ok"),("legacy_error","ok"),("sold","ok"),
+    ("no_budget","partial"),("unknown_status","partial"),("detail_failure","partial"),("platform","failed")])
+def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monkeypatch,case,expected):
+    monitor["watch_items"]=["999"]
+    monitor["analysis_budget"]["calls"]=1
+    monitor["scan_budget"]["details"]=1 if case=="no_budget" else 2
+    ledger.register(monitor,criteria_id(monitor));ledger.activate('a')
+    calls=[]
+    class Reads(FakeBrowser):
+        async def favorites(self,ids):
+            if case=="platform":raise CaptureError('platform_boundary')
+            if case=="legacy_error":raise CaptureError('favorite_price_schema_changed')
+            return [],{'source':'favorites','found':1,'missing':[],'unresolved':['999'],'pages':1,'truncated':True}
+        async def search(self,*args):
+            calls.append('search');return await super().search(*args)
+        async def detail(self,id):
+            calls.append(id)
+            if case=='detail_failure' and id=='999':raise CaptureError('detail_field_schema_changed')
+            return {'id':id,'price':4000,'description':'真实文字',
+                    'availability':'sold' if case=='sold' and id=='999' else 'unknown' if case=='unknown_status' else 'available'}
+    monkeypatch.setattr('src.cubi_monitor.cli.Browser',Reads)
+    result=asyncio.run(scan(ledger,monitor,{'reader_file':'unused','cdp':'http://127.0.0.1:9222'},analyzer=FakeAnalyzer()))
+    assert result['status']==expected and result['details']<=monitor['scan_budget']['details']
+    assert calls.count('search')==(0 if case=='platform' else 2)
+    if case=='recovered':assert result['coverage'][0]['resolved_by_detail']==['999']
+    if case=='no_budget':assert result['coverage'][0]['unresolved_after_detail']==['999']
+    if case=='detail_failure':assert calls.count('999')==1
+    if case=='sold':
+        assert ledger.item('a','999')['decision']=='rejected'
+        assert json.loads(ledger.item('a','999')['snapshot'])['availability']=='sold'
+
+
+def test_partial_favorite_rounds_rotate_unknown_targets(ledger,monitor,monkeypatch):
+    monitor['watch_items']=['998','999'];monitor['scan_budget']['details']=2;monitor['analysis_budget']['calls']=1
+    ledger.register(monitor,criteria_id(monitor));ledger.activate('a');watch_reads=[]
+    class Reads(FakeBrowser):
+        async def favorites(self,ids):return [],{'source':'favorites','found':2,'missing':[],'unresolved':ids,'pages':1}
+        async def detail(self,id):
+            if id in ('998','999'):watch_reads.append(id)
+            return {'id':id,'price':4000,'availability':'available'}
+    monkeypatch.setattr('src.cubi_monitor.cli.Browser',Reads)
+    runtime={'reader_file':'unused','cdp':'http://127.0.0.1:9222'}
+    for _ in range(2):
+        result=asyncio.run(scan(ledger,monitor,runtime,analyzer=FakeAnalyzer()))
+        assert result['status']=='partial'
+    assert watch_reads[0]=='998' and '999' in watch_reads
+
+
+def test_unknown_watch_price_state_waits_and_sold_never_sends(ledger,monitor,monkeypatch):
+    monitor['watch_items']=['123'];ledger.register(monitor,criteria_id(monitor));ledger.activate('a')
+    ledger.observe('a',{'id':'123','title':'示例','price':5000,'availability':'available'},'detail')
+    ledger.observe('a',{'id':'123','price':4000,'availability':'unknown'},'favorites',notify_changes=True)
+    monkeypatch.setattr('src.cubi_monitor.notifications.subprocess.run',lambda *a,**kw:pytest.fail('unconfirmed or sold send'))
+    assert flush(ledger,'a','/fake')['sent']==0
+    assert ledger.status('a')['outbox']=={'pending':1}
+    ledger.observe('a',{'id':'123','availability':'sold'},'detail')
+    assert flush(ledger,'a','/fake')['superseded']==1
+    assert ledger.item('a','123')['quote'] is None
+
+
+def test_sold_candidate_notification_rejected_even_after_bad_assessment(ledger,monitor,monkeypatch):
+    ledger.activate('a')
+    ledger.observe('a',{'id':'123','title':'示例','price':4000,'availability':'sold'},'detail')
+    assess(ledger,monitor,'123','candidate',notify=True)
+    monkeypatch.setattr('src.cubi_monitor.notifications.subprocess.run',lambda *a,**kw:pytest.fail('sold candidate send'))
+    assert flush(ledger,'a','/fake')['superseded']==1
+
+
 def test_unknown_gets_ai_and_replay_zero_calls(ledger,monitor,monkeypatch):
     monkeypatch.setattr("src.cubi_monitor.cli.Browser",FakeBrowser)
     monitor["baseline_refs"] = []

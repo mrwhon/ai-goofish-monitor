@@ -79,6 +79,8 @@ def validate_rules(criteria):
 
 def triage(item, profile):
     """Reject only explicit hard exclusions; all unknown configurations need analysis."""
+    if item.get("availability") in ("sold", "unavailable"):
+        return "rejected", "商品明确已售出或下架，不再作为在售候选"
     criteria = profile.get("criteria", {})
     if not isinstance(criteria, dict):
         return "needs_analysis", "筛选条件格式未知，保留待复评"

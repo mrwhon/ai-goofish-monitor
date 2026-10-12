@@ -383,7 +383,7 @@ def test_empty_favorites_do_not_navigate():
 def test_favorites_reads_only_targets_and_handles_wan_units():
     browser = fake_browser()
     browser.page.cards = [
-        {"href": "https://www.goofish.com/item?id=123", "text": "离线电脑 ¥1.05万"},
+        {"href": "https://www.goofish.com/item?id=123", "current_prices": ["¥1.05万"]},
         {"href": "https://www.goofish.com/item?id=999", "text": "无关：坏价格"},
         {"href": "https://other.example/item?id=456", "text": "坏价格"},
     ]
@@ -395,11 +395,44 @@ def test_favorites_reads_only_targets_and_handles_wan_units():
 
 
 @pytest.mark.parametrize("texts", [["价格待议"], ["¥100 原价¥200"], ["¥100", "¥200"]])
-def test_unknown_or_conflicting_favorite_prices_fail(texts):
+def test_unknown_or_conflicting_favorite_prices_isolate_item(texts):
     browser = fake_browser()
-    browser.page.cards = [{"href": "https://www.goofish.com/item?id=123", "text": text} for text in texts]
-    with pytest.raises(CaptureError, match="favorite_.*price"):
-        asyncio.run(browser.favorites(["123"]))
+    browser.page.cards = [{"href": "https://www.goofish.com/item?id=123", "current_prices": texts},
+                          {"href": "https://www.goofish.com/item?id=456", "current_prices": ["¥500"]}]
+    result = asyncio.run(browser.favorites(["123", "456"]))
+    assert result.items == [{"id": "456", "platform": "goofish", "price": 500}]
+    assert result.coverage["unresolved"] == ["123"]
+    assert result.coverage["found"] == 2 and result.coverage["truncated"]
+
+
+def test_favorite_current_price_is_separate_from_discount_and_title():
+    browser = fake_browser()
+    browser.page.cards = [{"href": "https://www.goofish.com/item?id=123",
+        "text": "相机 ¥6000 原价¥6888 收藏后 ¥888", "current_prices": ["¥6000"]}]
+    result = asyncio.run(browser.favorites(["123"]))
+    assert result.items[0]["price"] == 6000 and not result.coverage["unresolved"]
+
+
+def test_duplicate_or_missing_price_nodes_keep_other_favorites():
+    browser = fake_browser()
+    browser.page.cards = [
+        {"href":"https://www.goofish.com/item?id=123","current_prices":["¥500"]},
+        {"href":"https://www.goofish.com/item?id=123","current_prices":["¥600"]},
+        {"href":"https://www.goofish.com/item?id=456","current_prices":[]},
+        {"href":"https://www.goofish.com/item?id=789","current_prices":["¥700"]},
+        None,
+    ]
+    result = asyncio.run(browser.favorites(["123","456","789"]))
+    assert result.items == [{"id":"789","platform":"goofish","price":700}]
+    assert result.coverage["unresolved"] == ["123","456"]
+    assert result.coverage["skipped_cards"] == 1
+
+
+@pytest.mark.parametrize("status,expected",[("在线","available"),("卖掉了","sold"),("已下架","unavailable"),("未知新状态","unknown")])
+def test_detail_status_uses_explicit_platform_label(status,expected):
+    payload = fixture("detail")
+    payload["data"]["itemDO"]["itemStatusStr"] = status
+    assert parse_detail(payload,"123")["availability"] == expected
 
 
 def test_detail_uses_identity_and_target_api():
