@@ -390,6 +390,42 @@ def test_interrupted_run_recovered_under_exclusive_owner(ledger):
     assert ledger.db.execute('SELECT status FROM runs WHERE id=?',(first,)).fetchone()[0]=='interrupted'
 
 
+@pytest.mark.parametrize('status,delivery,expected', [
+    ('partial', {}, 0), ('ok', {}, 0), ('failed', {}, 1),
+    ('blocked', {}, 1), ('degraded', {}, 1),
+    ('partial', {'uncertain': 1}, 1), ('partial', {'retry': 1}, 1),
+])
+def test_scheduled_partial_does_not_hide_fatal_or_delivery_failures(status, delivery, expected):
+    from src.cubi_monitor.cli import monitor_exit_status
+    assert monitor_exit_status([{'status': status, 'delivery': delivery}], allow_partial=True) == expected
+    assert monitor_exit_status([{'status': 'partial'}]) == 1
+    assert monitor_exit_status([{'uncertain': 1}], allow_partial=True) == 1
+    assert monitor_exit_status([{'retry': 1}], allow_partial=True) == 1
+
+
+def test_partial_live_runs_do_not_reset_persistent_incompleteness_sentinel(ledger):
+    ledger.activate('a', now=1000)
+    for now in (2000, 4000, 1000 + 36*3600):
+        run = ledger.start_run('a', 'live', now)
+        with ledger.db:
+            ledger.db.execute("UPDATE runs SET status='partial',completed=? WHERE id=?", (now, run))
+    health = ledger.health('a', now=1000 + 36*3600 + 1)
+    assert health['status'] == 'degraded' and health['reason'] == 'missed_run'
+    assert health['last_success_at'] is None
+
+
+@pytest.mark.parametrize('command,expected', [('run', 0), ('scan', 1)])
+def test_cli_distinguishes_scheduled_partial_from_explicit_scan(tmp_path, monkeypatch, monitor, command, expected):
+    from src.cubi_monitor.cli import main
+    config = tmp_path / 'config.json'
+    config.write_text(json.dumps({'schema': 2, 'runtime': {'sender': 'unused'}, 'monitors': [monitor]}))
+    async def partial(*args, **kwargs):
+        return {'status': 'partial', 'coverage': [{'unconfirmed_status': ['123']}], 'error': None}
+    monkeypatch.setattr('src.cubi_monitor.cli.scan', partial)
+    monkeypatch.setattr('src.cubi_monitor.cli.flush', lambda *args: {'sent': 0, 'uncertain': 0, 'retry': 0})
+    assert main(['--config', str(config), '--database', str(tmp_path / 'db.sqlite3'), command]) == expected
+
+
 def test_database_lock_makes_concurrent_process_quiet(tmp_path,monkeypatch,capsys):
     import fcntl
     from src.cubi_monitor.cli import main

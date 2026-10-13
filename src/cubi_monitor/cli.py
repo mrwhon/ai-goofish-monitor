@@ -261,6 +261,18 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
     return {"status":status,"monitor_id":mid,"mode":mode,"run_id":run,"coverage":coverage,"analyses":analyzed,"details":details,"error":error,"collection":collection,**ledger.status(mid)}
 
 
+def monitor_exit_status(results, *, allow_partial=False):
+    # Partial coverage remains in runs and never advances the successful-live
+    # heartbeat. The independent 36h sentinel upgrades persistent incompleteness.
+    failures = {"failed", "blocked", "degraded"}
+    if not allow_partial:
+        failures.add("partial")
+    return int(any(r.get("status") in failures or
+                   r.get("uncertain") or r.get("retry") or
+                   r.get("delivery", {}).get("uncertain") or
+                   r.get("delivery", {}).get("retry") for r in results))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",required=True)
@@ -325,7 +337,7 @@ def main(argv=None):
                         ledger.db.execute("UPDATE outbox SET status=? WHERE monitor_id=? AND event=? AND status='uncertain'",("sent" if args.result == "sent" else "pending",mid,args.event))
                 results.append(result or ledger.status(mid))
             print(json.dumps(results,ensure_ascii=False))
-            return int(any(r.get("status") in ("failed","partial","blocked","degraded") or r.get("delivery",{}).get("uncertain") or r.get("delivery",{}).get("retry") for r in results))
+            return monitor_exit_status(results, allow_partial=args.command == "run")
         finally:
             ledger.close()
 

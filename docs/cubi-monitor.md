@@ -40,6 +40,12 @@ Login/challenge/rate-limit evidence blocks future capture globally. Recover the 
 
 Host API keys come from environment, never a config file. `runtime.ai` supplies an HTTPS endpoint, configured model, explicit verified price ceilings and a cumulative USD cap (max 3 in this implementation). UTF-8 byte/input and output-token bounds reserve cost before each request, including ambiguous failures; no refunds/retries assume success. Verify provider pricing/eligibility before using other providers. Trial integration uses the existing ordinary DeepSeek channel; [official pricing](https://api-docs.deepseek.com/quick_start/pricing/) was checked 2026-10-11 and the private profile sets ceilings at twice peak Flash rates. Its existing `deepseek-v4-flash` alias is currently served as V4.1 Flash; actual model/usage receipt is stored without secrets.
 
+Scheduled `run` retains per-item partial coverage but returns success for a single partial round.
+Partial runs never advance the successful-live heartbeat; the host's existing 36-hour
+sentinel escalates persistent incompleteness. Explicit `scan`/prepare still returns nonzero
+for partial results. Failed/blocked/degraded rounds and uncertain/retry delivery always
+remain nonzero, including when another task completes successfully.
+
 Focused checks, without upstream Web fixtures:
 
 ```
