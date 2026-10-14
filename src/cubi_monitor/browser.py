@@ -404,12 +404,51 @@ class Browser:
         if not expected_ids:
             return CaptureBatch([], coverage)
         await self.navigate("https://www.goofish.com/collection")
+        locator = self.page.locator('a[href*="/item?"]')
+        # Collection cards can mount after networkidle and load only on scroll.
+        # A blank DOM is not proof of an empty account collection.
+        for _ in range(10):
+            if await locator.count():
+                break
+            await asyncio.sleep(1)
+            await self.boundary()
+        else:
+            raise CaptureError("favorite_cards_not_ready")
         # Filter identities in-page before reading text, and collect no other cards.
-        cards = await self.page.locator('a[href*="/item?"]').evaluate_all("""(els, ids) => els.filter(e => {
+        script = """(els, ids) => els.filter(e => {
             const u = new URL(e.href); return u.hostname === 'www.goofish.com' &&
                 u.pathname === '/item' && ids.includes(u.searchParams.get('id'));
         }).map(e => ({href:e.href, current_prices:
-            [...e.querySelectorAll('[class^="priceLeft--"]')].map(p => p.innerText)}))""", sorted(expected_ids))
+            [...e.querySelectorAll('[class^="priceLeft--"]')].map(p => p.innerText)}))"""
+        cards, stable, previous = [], 0, None
+        coverage.update(scroll_steps=0, exhausted=False)
+        for step in range(49):
+            cards = await locator.evaluate_all(script, sorted(expected_ids))
+            present = set()
+            for card in cards:
+                if isinstance(card, dict) and isinstance(card.get("href"), str):
+                    parts = urlsplit(card["href"])
+                    if parts.hostname == "www.goofish.com" and parts.path == "/item":
+                        present.update(parse_qs(parts.query).get("id", []))
+            if expected_ids <= present:
+                break
+            geometry = await self.page.evaluate("""() => ({
+                count: document.querySelectorAll('a[href*="/item?"]').length,
+                height: document.documentElement.scrollHeight,
+                bottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2
+            })""")
+            state = (geometry["count"], geometry["height"])
+            stable = stable + 1 if geometry["bottom"] and state == previous else 0
+            if stable >= 3:
+                coverage["exhausted"] = True
+                break
+            if step == 48:
+                break
+            previous = state
+            await self.page.evaluate("window.scrollBy(0, 300)")
+            await asyncio.sleep(.75)
+            await self.boundary()
+            coverage["scroll_steps"] += 1
         items, found, unresolved = {}, set(), set()
         for card in cards:
             if not isinstance(card, dict) or not isinstance(card.get("href"), str):

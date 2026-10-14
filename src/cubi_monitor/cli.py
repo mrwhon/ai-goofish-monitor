@@ -18,7 +18,7 @@ from .contracts import AnalysisError, AnalysisInput, AnalysisResult
 from .ledger import Ledger, digest
 from .notifications import flush, message
 from .policy import criteria_id, matching_rule, triage
-from .transport import ChatTransport
+from .transport import configured_transport
 
 
 def prioritize(item, monitor):
@@ -110,7 +110,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
     initial = not prepare and prior == 0 and monitor["notification_policy"].get("initial_baseline_only",True)
     budget = {k:monitor["analysis_budget"][k] for k in ("input_chars","output_tokens")}
     try:
-        analyzer = analyzer or Analyzer(ChatTransport(runtime["ai"],ledger),budget=budget)
+        analyzer = analyzer or Analyzer(configured_transport(runtime["ai"],ledger),budget=budget)
         deadline = monitor["scan_budget"]["timeout"]
         if not prepare:
             deadline = min(deadline,ledger.monitor(mid)["expires_at"]-time.time())
@@ -163,9 +163,6 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                 for row in ledger.triage_rows(mid,monitor["scan_budget"]["triage_items"]):
                     rule_triage(ledger,monitor,row)
                 # Unclear/changed watches get the spare detail budget before routine rotation.
-                collection_slots = (monitor.get("collection_policy", {}).get("max_per_run", 1)
-                                    if not prepare and monitor.get("collection_policy", {}).get("enabled") else 0)
-                watch_slots = max(0,monitor["scan_budget"]["details"]-monitor["analysis_budget"]["calls"]-collection_slots)
                 targets = sorted(unresolved)
                 if targets:
                     # Partial rounds must rotate too; success-only cadence can starve another bad card.
@@ -174,7 +171,9 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                     targets = targets[offset:]+targets[:offset]
                 targets = list(dict.fromkeys([*targets,*changed_watch,*([watch[prior % len(watch)]] if watch else [])]))
                 resolved, failed_watches = set(), set()
-                for wid in targets[:watch_slots]:
+                # Watch recovery has priority. Cached details remain usable for AI;
+                # don't reserve slots for a collection that may never be needed.
+                for wid in targets[:monitor["scan_budget"]["details"]]:
                     details += 1  # Failed reads also consume the detail allocation.
                     try:
                         fact = await browser.detail(wid)
@@ -197,14 +196,13 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                     if unresolved-resolved or unconfirmed or favorite_entry.get("skipped_cards"):
                         status = "partial"
                 queue = ledger.pending(mid,monitor["analysis_budget"]["calls"])
-                reserved = (min(monitor.get("collection_policy", {}).get("max_per_run", 1),
-                                max(0, monitor["scan_budget"]["details"]-1))
-                            if not prepare and monitor.get("collection_policy", {}).get("enabled") else 0)
                 for row in queue:
                     if row["id"] in failed_watches:
                         continue
-                    if details >= monitor["scan_budget"]["details"]-reserved or analyzed >= monitor["analysis_budget"]["calls"]:
+                    if analyzed >= monitor["analysis_budget"]["calls"]:
                         break
+                    if row["id"] not in detail_cache and details >= monitor["scan_budget"]["details"]:
+                        continue
                     try:
                         if rule_triage(ledger,monitor,row) in ("rejected", "deferred"):
                             continue

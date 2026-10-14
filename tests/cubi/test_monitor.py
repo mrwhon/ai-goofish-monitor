@@ -270,7 +270,7 @@ class FakeAnalyzer:
 @pytest.mark.parametrize("case,expected",[("recovered","ok"),("legacy_error","ok"),("sold","ok"),
     ("no_budget","partial"),("unknown_status","partial"),("detail_failure","partial"),("platform","failed")])
 def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monkeypatch,case,expected):
-    monitor["watch_items"]=["999"]
+    monitor["watch_items"]=["998", "999"] if case == 'no_budget' else ["999"]
     monitor["analysis_budget"]["calls"]=1
     monitor["scan_budget"]["details"]=1 if case=="no_budget" else 2
     ledger.register(monitor,criteria_id(monitor));ledger.activate('a')
@@ -279,7 +279,7 @@ def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monk
         async def favorites(self,ids):
             if case=="platform":raise CaptureError('platform_boundary')
             if case=="legacy_error":raise CaptureError('favorite_price_schema_changed')
-            return [],{'source':'favorites','found':1,'missing':[],'unresolved':['999'],'pages':1,'truncated':True}
+            return [],{'source':'favorites','found':1,'missing':[],'unresolved':ids,'pages':1,'truncated':True}
         async def search(self,*args):
             calls.append('search');return await super().search(*args)
         async def detail(self,id):
@@ -300,7 +300,7 @@ def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monk
 
 
 def test_partial_favorite_rounds_rotate_unknown_targets(ledger,monitor,monkeypatch):
-    monitor['watch_items']=['998','999'];monitor['scan_budget']['details']=2;monitor['analysis_budget']['calls']=1
+    monitor['watch_items']=['998','999'];monitor['scan_budget']['details']=1;monitor['analysis_budget']['calls']=1
     ledger.register(monitor,criteria_id(monitor));ledger.activate('a');watch_reads=[]
     class Reads(FakeBrowser):
         async def favorites(self,ids):return [],{'source':'favorites','found':2,'missing':[],'unresolved':ids,'pages':1}
@@ -313,6 +313,25 @@ def test_partial_favorite_rounds_rotate_unknown_targets(ledger,monitor,monkeypat
         result=asyncio.run(scan(ledger,monitor,runtime,analyzer=FakeAnalyzer()))
         assert result['status']=='partial'
     assert watch_reads[0]=='998' and '999' in watch_reads
+
+
+def test_missing_watch_recovery_does_not_reserve_unused_ai_or_collection_slots(ledger,monitor,monkeypatch):
+    monitor['watch_items']=['991','992','993','994','995']
+    monitor['scan_budget']['details']=5
+    monitor['analysis_budget']['calls']=3
+    monitor['collection_policy']={'enabled':True,'max_per_run':1,'expected_account_id':'12345'}
+    ledger.register(monitor,criteria_id(monitor));ledger.activate('a');reads=[]
+    class Reads(FakeBrowser):
+        async def favorites(self,ids):
+            return [],{'source':'favorites','found':0,'missing':ids,'unresolved':[],'pages':1}
+        async def detail(self,id):
+            reads.append(id)
+            return {'id':id,'price':4000,'description':'合成详情','availability':'available'}
+    monkeypatch.setattr('src.cubi_monitor.cli.Browser',Reads)
+    result=asyncio.run(scan(ledger,monitor,{'reader_file':'unused','cdp':'http://127.0.0.1:9222'},analyzer=FakeAnalyzer()))
+    assert result['status']=='ok' and set(reads)==set(monitor['watch_items'])
+    assert result['details']==5 and result['coverage'][0]['unresolved_after_detail']==[]
+    assert result['analyses']>0  # Cached watch details can still be assessed at the detail limit.
 
 
 def test_unknown_watch_price_state_waits_and_sold_never_sends(ledger,monitor,monkeypatch):

@@ -118,6 +118,10 @@ class Locator:
         self.page, self.name = page, name
 
     async def count(self):
+        if self.name == 'a[href*="/item?"]':
+            if getattr(self.page, 'card_counts', None):
+                return self.page.card_counts.pop(0)
+            return len(self.page.cards)
         if self.name == NEXT_SELECTOR:
             return self.page.next_count
         if self.name in ("3天内", "最新"):
@@ -168,6 +172,13 @@ class Page:
 
     def locator(self, selector):
         return Locator(self, selector)
+
+    async def evaluate(self, script):
+        if script == 'window.scrollBy(0, 300)':
+            if getattr(self, 'on_scroll', None):
+                self.on_scroll()
+            return None
+        return {'count': len(self.cards), 'height': 100, 'bottom': True}
 
     def get_by_text(self, text, exact):
         assert exact
@@ -411,6 +422,38 @@ def test_favorite_current_price_is_separate_from_discount_and_title():
         "text": "相机 ¥6000 原价¥6888 收藏后 ¥888", "current_prices": ["¥6000"]}]
     result = asyncio.run(browser.favorites(["123"]))
     assert result.items[0]["price"] == 6000 and not result.coverage["unresolved"]
+
+
+def test_favorites_waits_for_delayed_render_and_loads_next_cards():
+    browser = fake_browser()
+    browser.page.cards = [{'href': 'https://www.goofish.com/item?id=123', 'current_prices': ['¥500']}]
+    browser.page.card_counts = [0, 0, 1]
+    browser.page.on_scroll = lambda: browser.page.cards.append(
+        {'href': 'https://www.goofish.com/item?id=456', 'current_prices': ['¥600']})
+    result = asyncio.run(browser.favorites(['123', '456']))
+    assert {row['id'] for row in result.items} == {'123', '456'}
+    assert result.coverage['scroll_steps'] == 1 and result.coverage['missing'] == []
+
+
+def test_favorites_missing_item_stops_at_stable_bottom():
+    browser = fake_browser()
+    browser.page.cards = [{'href': 'https://www.goofish.com/item?id=123', 'current_prices': ['¥500']}]
+    result = asyncio.run(browser.favorites(['123', '456']))
+    assert result.coverage['exhausted'] is True
+    assert result.coverage['scroll_steps'] == 3 and result.coverage['missing'] == ['456']
+
+
+def test_blank_collection_is_not_successful_empty():
+    with pytest.raises(CaptureError, match='favorite_cards_not_ready'):
+        asyncio.run(fake_browser().favorites(['123']))
+
+
+def test_favorite_scroll_stops_immediately_on_platform_boundary():
+    browser = fake_browser()
+    browser.page.cards = [{'href': 'https://www.goofish.com/item?id=123', 'current_prices': ['¥500']}]
+    browser.page.on_scroll = lambda: setattr(browser.page, 'body', '请完成验证')
+    with pytest.raises(CaptureError, match='visible_platform_boundary'):
+        asyncio.run(browser.favorites(['456']))
 
 
 def test_duplicate_or_missing_price_nodes_keep_other_favorites():
