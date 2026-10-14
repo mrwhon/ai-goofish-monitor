@@ -180,7 +180,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                         detail_cache[wid] = fact
                         ledger.observe(mid,fact,"watch_detail",notify_changes=not prepare and not initial)
                         rule_triage(ledger,monitor,ledger.item(mid,wid))
-                        if fact.get("price") is not None:
+                        if fact.get("price") is not None or fact.get("availability") in ("sold", "unavailable"):
                             resolved.add(wid)
                     except (CaptureError,ValueError) as exc:
                         if any(mark in str(exc).upper() for mark in ("PLATFORM_BOUNDARY","VISIBLE_","LOGIN","VALIDATE","RGV","BAXIA")):

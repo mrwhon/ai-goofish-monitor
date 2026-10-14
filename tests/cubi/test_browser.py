@@ -118,6 +118,8 @@ class Locator:
         self.page, self.name = page, name
 
     async def count(self):
+        if self.name == '糟糕！宝贝被删掉了':
+            return int(self.page.body == self.name)
         if self.name == 'a[href*="/item?"]':
             if getattr(self.page, 'card_counts', None):
                 return self.page.card_counts.pop(0)
@@ -130,6 +132,9 @@ class Locator:
 
     async def is_enabled(self):
         return self.page.next_enabled
+
+    async def is_visible(self):
+        return True
 
     async def inner_text(self, **kwargs):
         return self.page.body
@@ -197,7 +202,8 @@ class Page:
         return Expectation()
 
     async def wait_for_load_state(self, *args, **kwargs):
-        pass
+        if getattr(self, 'on_settle', None):
+            self.on_settle()
 
     def on(self, event, callback):
         self.listeners[event] = callback
@@ -443,6 +449,16 @@ def test_favorites_missing_item_stops_at_stable_bottom():
     assert result.coverage['scroll_steps'] == 3 and result.coverage['missing'] == ['456']
 
 
+def test_bottom_geometry_does_not_hide_batch_still_loading():
+    browser=fake_browser()
+    browser.page.cards=[{'href':'https://www.goofish.com/item?id=123','current_prices':['¥500']}]
+    browser.page.on_settle=lambda:browser.page.cards.append(
+        {'href':'https://www.goofish.com/item?id=456','current_prices':['¥600']})
+    result=asyncio.run(browser.favorites(['123','456']))
+    assert result.coverage['found']==2 and result.coverage['missing']==[]
+    assert result.coverage['exhausted'] is False
+
+
 def test_blank_collection_is_not_successful_empty():
     with pytest.raises(CaptureError, match='favorite_cards_not_ready'):
         asyncio.run(fake_browser().favorites(['123']))
@@ -488,6 +504,30 @@ def test_detail_uses_identity_and_target_api():
     assert browser.page.url.endswith("?id=123")
     with pytest.raises(ValueError, match="invalid_item_id"):
         asyncio.run(browser.detail("../123"))
+
+
+def test_deleted_item_notice_resolves_without_missing_api():
+    browser=fake_browser()
+    async def navigate(url):
+        browser.page.url=url;browser.page.body='糟糕！宝贝被删掉了'
+    browser.navigate=navigate
+    assert asyncio.run(browser.detail('123')) == {'id':'123','platform':'goofish','availability':'unavailable'}
+    browser.page.url='https://www.goofish.com/item?id=456'
+    assert asyncio.run(browser._deleted_item('123')) is False
+
+
+@pytest.mark.parametrize('blocked',[False,True])
+def test_deleted_item_network_idle_fallback_still_checks_platform_boundary(blocked):
+    browser=fake_browser()
+    async def navigate(page,url,args):
+        page.url=url;page.body='请完成验证' if blocked else '糟糕！宝贝被删掉了'
+        raise RuntimeError('network_not_idle')
+    browser.reader.navigate=navigate
+    if blocked:
+        with pytest.raises(CaptureError,match='visible_platform_boundary'):
+            asyncio.run(browser.detail('123'))
+    else:
+        assert asyncio.run(browser.detail('123'))['availability']=='unavailable'
 
 
 def install_fake_playwright(monkeypatch, failure=None, cleanup_failure=False):

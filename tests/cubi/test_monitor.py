@@ -267,7 +267,7 @@ class FakeAnalyzer:
         return AnalysisResult("reserve","需核实",comparison="缺少完整规格",evidence_gaps=["图片未检查"])
 
 
-@pytest.mark.parametrize("case,expected",[("recovered","ok"),("legacy_error","ok"),("sold","ok"),
+@pytest.mark.parametrize("case,expected",[("recovered","ok"),("legacy_error","ok"),("sold","ok"),("deleted","ok"),
     ("no_budget","partial"),("unknown_status","partial"),("detail_failure","partial"),("platform","failed")])
 def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monkeypatch,case,expected):
     monitor["watch_items"]=["998", "999"] if case == 'no_budget' else ["999"]
@@ -285,6 +285,7 @@ def test_favorite_failure_isolation_and_bounded_confirmation(ledger,monitor,monk
         async def detail(self,id):
             calls.append(id)
             if case=='detail_failure' and id=='999':raise CaptureError('detail_field_schema_changed')
+            if case=='deleted' and id=='999':return {'id':id,'availability':'unavailable'}
             return {'id':id,'price':4000,'description':'真实文字',
                     'availability':'sold' if case=='sold' and id=='999' else 'unknown' if case=='unknown_status' else 'available'}
     monkeypatch.setattr('src.cubi_monitor.cli.Browser',Reads)

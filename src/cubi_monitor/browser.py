@@ -242,6 +242,9 @@ class Browser:
             if str(exc) != "network_not_idle" or api is None:
                 raise
             await self.boundary()
+            if path == "/item" and await self._deleted_item(parse_qs(urlsplit(url).query)["id"][0]):
+                await asyncio.sleep(2.2)
+                return
             payload = await self.payload(api)
             if api == SEARCH_API:
                 parse_search_checked(payload)
@@ -342,11 +345,21 @@ class Browser:
             await self.settle_click(next_control)
         return CaptureBatch(list(items.values()), coverage)
 
+    async def _deleted_item(self, item_id):
+        parts = urlsplit(self.page.url)
+        if (parts.scheme != "https" or parts.hostname != "www.goofish.com" or parts.path != "/item"
+                or parse_qs(parts.query).get("id") != [item_id]):
+            return False
+        notice = self.page.get_by_text("糟糕！宝贝被删掉了", exact=True)
+        return await notice.count() == 1 and await notice.is_visible()
+
     async def detail(self, item_id):
         item_id = item_id_value(item_id)
         if not item_id:
             raise ValueError("invalid_item_id")
         await self.navigate(f"https://www.goofish.com/item?id={item_id}")
+        if await self._deleted_item(item_id):
+            return {"id": item_id, "platform": "goofish", "availability": "unavailable"}
         return parse_detail(await self.payload(DETAIL_API), item_id)
 
     async def favorite(self, item_id, account_id, guard, before_click, allow_click=True):
@@ -420,7 +433,7 @@ class Browser:
                 u.pathname === '/item' && ids.includes(u.searchParams.get('id'));
         }).map(e => ({href:e.href, current_prices:
             [...e.querySelectorAll('[class^="priceLeft--"]')].map(p => p.innerText)}))"""
-        cards, stable, previous = [], 0, None
+        cards, stable, previous, settled_bottom = [], 0, None, None
         coverage.update(scroll_steps=0, exhausted=False)
         for step in range(49):
             cards = await locator.evaluate_all(script, sorted(expected_ids))
@@ -438,6 +451,15 @@ class Browser:
                 bottom: window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2
             })""")
             state = (geometry["count"], geometry["height"])
+            if geometry["bottom"] and settled_bottom != state:
+                # The bottom sentinel can start another asynchronous batch.
+                # Settle it before unchanged geometry can imply exhaustion.
+                await self.page.wait_for_load_state("networkidle", timeout=8000)
+                await asyncio.sleep(2.2)
+                await self.boundary()
+                settled_bottom = state
+                stable = 0
+                continue
             stable = stable + 1 if geometry["bottom"] and state == previous else 0
             if stable >= 3:
                 coverage["exhausted"] = True

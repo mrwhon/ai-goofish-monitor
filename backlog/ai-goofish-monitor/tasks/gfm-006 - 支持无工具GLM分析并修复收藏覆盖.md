@@ -5,7 +5,7 @@ status: Done
 assignee:
   - codex
 created_date: '2026-10-14 12:42'
-updated_date: '2026-10-14 12:57'
+updated_date: '2026-10-14 13:26'
 labels: []
 dependencies: []
 type: bug
@@ -43,10 +43,16 @@ Cubi CUB-070已授权切换闲鱼两组分析到既有GLM并修复收藏漏读�
 发现与处置：F1初始收藏DOM漏读延迟与滚动加载；F2缺失关注补查额度仅1使单次无法恢复完整；F3仅有chat API且actual model回执需GLM CLI支持。属于CUB-070直接依赖，当前owner可直接改此干净canonical仓，无独立owner工单。
 
 发现与处置结案：F1离线延迟挂载、滚动加载、稳定底部、空DOM及风控停止回归通过；F2五个缺失关注/五详情/三AI/启用收藏的合成回归证明全部补齐且复用缓存仍可AI，无多余固定预留；F3Claude统计使用客户端alias，采用stream-json assistant model核provider，真实合成调用证明glm-5.3-flash/claude-sonnet-5分别绑定，单轮289输出token并通过Analyzer JSON边界。核心回归281通过、新增额度回归1通过，diff检查通过。无schema迁移，旧API兼容和历史保留。宿主真实闲鱼巡检因前轮visible_platform_boundary等待用户同账号手动恢复，由CUB-070持有，不是核心离线失败。
+
+现场新证据使F1需要补齐：用户确认继续Cubi且账号核对一致。首次修复真实favorites在10步底部判断稳定只找到1/7关注；时序探针确认第8步第二批由20增至33。底部连续三次计数不足以排除异步加载尚未完成，补末端networkidle与settlement等待并重新验。其它GLM与额度验收仍有效。
+
+真实live run20仅余缺失关注的详情CaptureError；只读CLI现场显示精确平台通知“糟糕！宝贝被删掉了”。新增同URL/id且唯一可见删除通知的详情结果unavailable，登录/风控仍先验证；终态无当前价格也可完成关注确认，保留历史价格/报价，不把已删除商品当采集故障。为URL身份、正常返回、networkidle及无价格终态补回归。Mac live run21已ok且actual GLM回执验证通过。
+
+F1/F2实际结案：287核心离线回归全通过（14.51秒）、diff检查通过。补底部networkidle/渲染settlement后现场读取6/7关注；唯一缺失旧商品平台明确删除通知，加入URL/id+唯一可见提示确认终态并保留历史价。正式Mac live run21=ok/3详情2AI；PC最终live run22=ok/3详情1AI，两缺失关注均经详情解决，无unconfirmed_status；actual GLM回执glm-5.3-flash，client claude-sonnet-5，单轮869输出token。Cubi独立health=v1 ok/null，期限原值不变。没有新增收藏、没有发送新通知、没有交易。后续宿主收尾由CUB-070完成。
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-新增无工具单轮Claude CLI分析transport，stream JSON核对实际provider模型及独立client usage，无provider回退；修复收藏延迟/滚动覆盖和关注详情额度。281项核心回归及1项新增真实失败场景回归通过，GLM合成完整分析通过。真实平台复跑仍由CUB-070等待同账号恢复。
+GLM CLI单轮无工具分析已真实验证；修复收藏首批/滚动/末端异步加载和详情额度，精确页面删除通知确认终态并保留历史价格。287核心回归通过，Mac run21和PC run22均ok，实际glm-5.3-flash回执及健康哨兵ok。
 <!-- SECTION:FINAL_SUMMARY:END -->
