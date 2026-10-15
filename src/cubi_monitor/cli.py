@@ -14,7 +14,7 @@ from .analysis import Analyzer
 from .browser import Browser, CaptureError
 from .collection import collect_candidates
 from .config import load_config
-from .contracts import AnalysisError, AnalysisInput, AnalysisResult
+from .contracts import AnalysisError, AnalysisInput, AnalysisResult, RuntimePreparationError
 from .ledger import Ledger, digest
 from .notifications import flush, message
 from .policy import criteria_id, matching_rule, triage
@@ -93,7 +93,8 @@ def finalize_expiry(ledger, monitor, now=None):
     summary_event(ledger,monitor,"final",f"闲鱼监控试运行到期 [{mid}]\n已停止采集与AI调用。完成 {runs} 次巡检，{assessments} 次判断，保留 {status['items']} 个商品的历史。\n到期不代表已买到合适商品；详细数据保留在本机。",m["expires_at"])
 
 
-async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyzer=None, cache=None):
+async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyzer=None, cache=None,
+               preparation_error=None, allow_collection=True):
     mid = monitor["monitor_id"]
     if not monitor.get("enabled",True) or (not prepare and not ledger.active(mid)):
         return {"status":"inactive_or_expired",**ledger.status(mid)}
@@ -109,13 +110,18 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
     cache = {} if cache is None else cache
     initial = not prepare and prior == 0 and monitor["notification_policy"].get("initial_baseline_only",True)
     budget = {k:monitor["analysis_budget"][k] for k in ("input_chars","output_tokens")}
+    stage = "analysis_setup"
     try:
+        if preparation_error is not None:
+            raise preparation_error
         analyzer = analyzer or Analyzer(configured_transport(runtime["ai"],ledger),budget=budget)
         deadline = monitor["scan_budget"]["timeout"]
         if not prepare:
             deadline = min(deadline,ledger.monitor(mid)["expires_at"]-time.time())
         async with asyncio.timeout(deadline):
+            stage = "browser_connect"
             async with Browser(runtime["reader_file"],runtime["cdp"]) as browser:
+                stage = "capture"
                 watch = monitor.get("watch_items",[])
                 # Successfully saved candidates become task watches without editing private config.
                 watch = list(dict.fromkeys([*watch, *[r[0] for r in ledger.db.execute(
@@ -185,7 +191,7 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                     except (CaptureError,ValueError) as exc:
                         if any(mark in str(exc).upper() for mark in ("PLATFORM_BOUNDARY","VISIBLE_","LOGIN","VALIDATE","RGV","BAXIA")):
                             raise
-                        coverage.append({"source":"watch_detail","id":wid,"error":type(exc).__name__,"truncated":True})
+                        coverage.append({"source":"watch_detail","id":wid,"error":safe_error(exc, "capture"),"truncated":True})
                         failed_watches.add(wid)
                         status = "partial"
                 if favorite_entry is not None:
@@ -231,18 +237,17 @@ async def scan(ledger, monitor, runtime, prepare=False, query_limit=None, analyz
                         detail = str(exc).split(":", 1)[0]
                         safe = detail if re.fullmatch(r"[a-z_]{1,80}", detail) else type(exc).__name__
                         ledger.mark_error(mid,row["id"],safe)
+                        error = "analysis_failed:" + safe
                         status = "partial"
-                if not prepare and status == "ok":
+                if not prepare and status == "ok" and allow_collection:
                     collection = await collect_candidates(ledger,monitor,browser,
                         detail_budget=monitor["scan_budget"]["details"]-details)
                     details += collection["detail_reads"]
                     if collection["uncertain"] or collection["failed"]:
                         status = "partial"
     except Exception as exc:
-        status, error = "failed", type(exc).__name__
+        status, error = "failed", safe_error(exc, stage)
         detail = str(exc)
-        if re.fullmatch(r"[a-z_]{1,80}", detail) and detail.startswith(("visible_","platform_","page_","search_","detail_","image_","favorite_","collection_","expected_","invalid_api_","network_not_idle","owned_target_")):
-            error += ":" + detail
         if any(mark in detail for mark in ("platform_boundary","visible_login_or_challenge","LOGIN","SESSION_EXPIRED","VALIDATE","RGV","BAXIA")):
             ledger.meta("blocked","platform_boundary")
             with ledger.db:
@@ -271,14 +276,36 @@ def monitor_exit_status(results, *, allow_partial=False):
                    r.get("delivery", {}).get("retry") for r in results))
 
 
-def main(argv=None):
+def safe_error(exc, stage):
+    """Keep known page codes, classify transport failures, never persist raw URLs."""
+    detail = str(exc)
+    if isinstance(exc, RuntimePreparationError):
+        return "RuntimePreparationError:" + detail
+    if re.fullmatch(r"[a-z_]{1,80}", detail) and detail.startswith(("visible_","platform_","page_","search_","detail_","image_","favorite_","collection_","expected_","invalid_api_","network_not_idle","owned_target_")):
+        return type(exc).__name__ + ":" + detail
+    from playwright.async_api import Error, TimeoutError as BrowserTimeout
+    if isinstance(exc, (TimeoutError, BrowserTimeout)):
+        return "browser_timeout" if stage == "browser_connect" else "capture_timeout"
+    if isinstance(exc, Error):
+        if stage == "browser_connect":
+            return "browser_unavailable"
+        if any(mark in detail.lower() for mark in ("has been closed", "connection closed", "disconnected")):
+            return "browser_disconnected"
+        return "page_read_failed"
+    return type(exc).__name__
+
+
+def main(argv=None, *, prepare_runtime=None, scheduled_failure_code=1, allow_collection=True):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",required=True)
     parser.add_argument("--database",required=True)
     parser.add_argument("--monitor")
     commands = parser.add_subparsers(dest="command",required=True)
-    for name in ("register","status","activate","stop","resume","unblock","health","run"):
+    for name in ("register","status","activate","stop","resume","unblock","health"):
         commands.add_parser(name)
+    scheduled = commands.add_parser("run")
+    scheduled.add_argument("--no-collection", action="store_true",
+        help="Collect and analyze normally, but perform no favorite mutations")
     capture = commands.add_parser("scan")
     capture.add_argument("--prepare",action="store_true")
     capture.add_argument("--query-limit",type=int,choices=range(1,9))
@@ -288,6 +315,7 @@ def main(argv=None):
     reconcile.add_argument("event")
     reconcile.add_argument("--result",choices=("sent","retry"),required=True)
     args = parser.parse_args(argv)
+    allow_collection = allow_collection and not getattr(args, "no_collection", False)
     config = load_config(args.config)
     path = Path(args.database)
     if not path.parent.is_dir():
@@ -307,6 +335,16 @@ def main(argv=None):
             for m in config["monitors"]:
                 ledger.register(m,criteria_id(m))
             results, cache = [], {}
+            preparation_error = None
+            if prepare_runtime is not None and args.command in ("run", "scan"):
+                candidates = [m for m in selected if m.get("enabled", True)
+                    and (getattr(args, "prepare", False) or ledger.active(m["monitor_id"]))
+                    and not ledger.meta("blocked") and not ledger.monitor(m["monitor_id"])["blocked"]]
+                if candidates:
+                    try:
+                        prepare_runtime(config["runtime"])
+                    except RuntimePreparationError as exc:
+                        preparation_error = exc
             for m in selected:
                 mid = m["monitor_id"]
                 result = None
@@ -323,7 +361,16 @@ def main(argv=None):
                         ledger.db.execute("UPDATE monitors SET blocked=NULL WHERE monitor_id=?",(mid,))
                 elif args.command in ("scan","run"):
                     finalize_expiry(ledger,m)
-                    result = asyncio.run(scan(ledger,m,config["runtime"],getattr(args,"prepare",False),getattr(args,"query_limit",None),cache=cache))
+                    options = {"cache": cache}
+                    if preparation_error is not None:
+                        options["preparation_error"] = preparation_error
+                    if not allow_collection:
+                        options["allow_collection"] = False
+                    result = asyncio.run(scan(ledger,m,config["runtime"],getattr(args,"prepare",False),getattr(args,"query_limit",None),**options))
+                    # A failed initial connection is common to the batch. Never
+                    # replay collection, or reconnect once per remaining task.
+                    if result.get("error") in ("browser_unavailable", "browser_timeout") and not result.get("coverage") and not result.get("details") and not result.get("analyses"):
+                        preparation_error = RuntimePreparationError(result["error"])
                     if args.command == "run":
                         result["delivery"] = flush(ledger,mid,config["runtime"]["sender"])
                 elif args.command == "flush":
@@ -335,9 +382,22 @@ def main(argv=None):
                         ledger.db.execute("UPDATE outbox SET status=? WHERE monitor_id=? AND event=? AND status='uncertain'",("sent" if args.result == "sent" else "pending",mid,args.event))
                 results.append(result or ledger.status(mid))
             print(json.dumps(results,ensure_ascii=False))
-            return monitor_exit_status(results, allow_partial=args.command == "run")
+            rc = monitor_exit_status(results, allow_partial=args.command == "run")
+            # Only failures with durable, recognized evidence may delegate to
+            # host health supervision. Unexpected exceptions keep exit 1.
+            recognized = all(r.get("status") != "failed" or recognized_failure(r.get("error", "")) for r in results)
+            if rc and args.command == "run" and recognized and not any(
+                    r.get("delivery", {}).get("uncertain") or r.get("delivery", {}).get("retry") for r in results):
+                return scheduled_failure_code
+            return rc
         finally:
             ledger.close()
+
+
+def recognized_failure(error):
+    return error in {"browser_unavailable", "browser_timeout", "browser_disconnected", "capture_timeout", "page_read_failed"} or (
+        isinstance(error, str) and re.fullmatch(r"[A-Za-z]+:[a-z_]{1,80}", error) is not None
+        and error.split(":", 1)[1].startswith(("browser_", "visible_", "platform_", "page_", "search_", "detail_", "image_", "favorite_", "collection_", "expected_", "invalid_api_", "network_not_idle", "owned_target_")))
 
 
 if __name__ == "__main__":

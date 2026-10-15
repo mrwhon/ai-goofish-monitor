@@ -48,6 +48,25 @@ sentinel escalates persistent incompleteness. Explicit `scan`/prepare still retu
 for partial results. Failed/blocked/degraded rounds and uncertain/retry delivery always
 remain nonzero, including when another task completes successfully.
 
+Hosts may inject `prepare_runtime(runtime)` into `cli.main`. It runs once under the
+existing database lock, only for enabled, active, unblocked tasks (or an explicit
+prepare scan). The host owns service management and fixed browser selection; the
+core never imports host units or follows a human browser role. A safe
+`RuntimePreparationError` records a zero-collection failed run for each eligible
+task without repeating the preparation. Initial CDP connection failure also
+short-circuits remaining tasks; already-started collection is never replayed.
+Connection timeout is 10 seconds. Safe errors distinguish connection, disconnection,
+capture timeout, page schema/platform boundaries and analysis failures.
+
+The default CLI exit behavior is unchanged. A host can explicitly select
+`scheduled_failure_code=10` for durable, classified scheduled failures and pair it
+with systemd `SuccessExitStatus=10`; its independent health probe must then own
+failure/recovery notifications. Unknown errors and uncertain/retry delivery retain
+exit 1. A successful systemd invocation alone does not prove complete coverage.
+`run --no-collection` performs live collection/analysis and normal outbox delivery
+while suppressing favorite mutations, for bounded operational verification. It
+does not change stored collection policy or subsequent scheduled behavior.
+
 Focused checks, without upstream Web fixtures:
 
 ```

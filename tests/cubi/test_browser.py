@@ -554,7 +554,8 @@ def install_fake_playwright(monkeypatch, failure=None, cleanup_failure=False):
         async def close(self):
             events.append("disconnect")
     class Chromium:
-        async def connect_over_cdp(self, endpoint):
+        async def connect_over_cdp(self, endpoint, *, timeout):
+            assert 0 < timeout <= 10000
             events.append("connect")
             if failure == "connect":
                 raise CaptureError("connect_failure")

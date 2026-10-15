@@ -203,7 +203,7 @@ class Browser:
         from playwright.async_api import async_playwright
         self.playwright = await async_playwright().start()
         try:
-            self.connected_browser = await self.playwright.chromium.connect_over_cdp(self.endpoint)
+            self.connected_browser = await self.playwright.chromium.connect_over_cdp(self.endpoint, timeout=10000)
             self.reader = self.reader_type(self.connected_browser)
             await self.reader.open()
             self.page = await self.reader.background_page()

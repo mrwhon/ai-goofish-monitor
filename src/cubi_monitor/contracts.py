@@ -36,3 +36,12 @@ class AnalysisResult:
 class AnalysisError(RuntimeError):
     """Retryable analysis failure; must not advance assessed fingerprints."""
 
+
+class RuntimePreparationError(RuntimeError):
+    """Safe, host-owned failure before collection; never contains raw diagnostics."""
+
+    def __init__(self, code):
+        if code not in {"browser_unavailable", "browser_timeout", "browser_config_mismatch"}:
+            raise ValueError("invalid_preparation_error")
+        super().__init__(code)
+
